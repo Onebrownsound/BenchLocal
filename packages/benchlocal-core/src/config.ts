@@ -61,6 +61,14 @@ export type BenchLocalRegistryConfig = {
   official_url: string;
 };
 
+export type BenchLocalAgentAccess = "localhost" | "local_network";
+
+export type BenchLocalAgentConfig = {
+  enabled: boolean;
+  access: BenchLocalAgentAccess;
+  port?: number;
+};
+
 export type BenchLocalConfig = {
   schema_version: 1;
   default_benchpack: string;
@@ -72,6 +80,7 @@ export type BenchLocalConfig = {
   ui: {
     theme: string;
   };
+  agent?: BenchLocalAgentConfig;
   providers: Record<string, BenchLocalProviderConfig>;
   models: BenchLocalModelConfig[];
   benchpacks: Record<string, BenchLocalBenchPackConfig>;
@@ -168,6 +177,16 @@ const ConfigSchema = z.object({
     .default({
       theme: "system"
   }),
+  agent: z
+    .object({
+      enabled: z.boolean().default(false),
+      access: z.enum(["localhost", "local_network"]).default("localhost"),
+      port: z.number().int().min(0).max(65535).optional()
+    })
+    .default({
+      enabled: false,
+      access: "localhost"
+    }),
   providers: z.record(z.string(), ProviderSchema).default({}),
   models: z.array(ModelSchema).default([]),
   benchpacks: z.record(z.string(), BenchPackSchema).default({})
@@ -232,6 +251,10 @@ function inferProviderName(providerId: string, kind: BenchLocalProviderKind): st
       return "Pico";
     case "openai_compatible":
     default: {
+      if (/^openai[_-]compatible-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(providerId.trim())) {
+        return "OpenAI Compatible";
+      }
+
       const cleaned = providerId.replace(/[_-]+/g, " ").trim();
       if (!cleaned) {
         return "OpenAI Compatible";
@@ -257,6 +280,10 @@ export function createDefaultConfig(): BenchLocalConfig {
     },
     ui: {
       theme: "system"
+    },
+    agent: {
+      enabled: false,
+      access: "localhost"
     },
     providers: {},
     models: [],
@@ -334,6 +361,12 @@ function normalizeConfig(raw: unknown): BenchLocalConfig {
       ...defaults.ui,
       ...parsed.ui
     },
+    agent: {
+      ...(defaults.agent ?? { enabled: false, access: "localhost" }),
+      ...(parsed.agent ?? {}),
+      access: parsed.agent.access ?? defaults.agent?.access ?? "localhost",
+      port: parsed.agent.port === 0 ? undefined : parsed.agent.port
+    },
     providers: normalizedProviders,
     benchpacks: Object.fromEntries(
       Object.entries(parsed.benchpacks).map(([benchPackId, benchPack]) => [
@@ -354,11 +387,11 @@ function normalizeConfig(raw: unknown): BenchLocalConfig {
 
   for (const model of config.models) {
     if (seenModelIds.has(model.id)) {
-      throw new Error(`Duplicate model id "${model.id}" found in models.`);
+      throw new Error(`Duplicate model "${model.label || model.model || model.id}" found in models.`);
     }
 
     if (!config.providers[model.provider]) {
-      throw new Error(`Model "${model.id}" references unknown provider "${model.provider}".`);
+      throw new Error(`Model "${model.label || model.model || model.id}" references unknown provider "${inferProviderName(model.provider, inferProviderKind(model.provider))}".`);
     }
 
     seenModelIds.add(model.id);

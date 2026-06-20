@@ -6,17 +6,21 @@ import { loadAppMetadata } from "./app-metadata";
 import { APP_OPEN_ABOUT_CHANNEL, APP_OPEN_SETTINGS_CHANNEL, registerIpcHandlers, stopActiveBenchPackRunsForShutdown } from "./ipc";
 import { loadAvailableTheme } from "./themes";
 import { checkForAppUpdatesInteractively, initializeAppUpdater } from "./updater";
+import { agentServer } from "./agent-server";
 
 const isDev = !app.isPackaged;
 const shouldOpenDevTools = process.env.BENCHLOCAL_OPEN_DEVTOOLS === "1";
 const isMac = process.platform === "darwin";
 let isQuittingAfterBenchPackShutdown = false;
 let isPreparingToQuit = false;
+let forceQuitTimer: NodeJS.Timeout | null = null;
 const DEFAULT_WINDOW_WIDTH = 1500;
 const DEFAULT_WINDOW_HEIGHT = 800;
 const MIN_WINDOW_WIDTH = 1180;
 const MIN_WINDOW_HEIGHT = 768;
 const WINDOW_STATE_PATH = path.join(getBenchLocalHome(), "window-state.json");
+const GRACEFUL_SHUTDOWN_TIMEOUT_MS = isDev ? 3_000 : 15_000;
+const FORCE_QUIT_TIMEOUT_MS = isDev ? 6_000 : 20_000;
 
 type PersistedWindowState = {
   width: number;
@@ -69,15 +73,52 @@ if (isMac) {
   app.setName("BenchLocal");
 }
 
+function clearForceQuitTimer(): void {
+  if (!forceQuitTimer) {
+    return;
+  }
+
+  clearTimeout(forceQuitTimer);
+  forceQuitTimer = null;
+}
+
+function forceExitForShutdown(reason: string): void {
+  console.warn(`[benchlocal] forcing app exit: ${reason}`);
+  clearForceQuitTimer();
+  app.exit(0);
+}
+
+function scheduleForceExitForShutdown(reason: string): void {
+  clearForceQuitTimer();
+  forceQuitTimer = setTimeout(() => {
+    forceExitForShutdown(reason);
+  }, FORCE_QUIT_TIMEOUT_MS);
+  forceQuitTimer.unref?.();
+}
+
 function requestAppQuit(): void {
-  if (isPreparingToQuit || isQuittingAfterBenchPackShutdown) {
+  if (isQuittingAfterBenchPackShutdown) {
+    return;
+  }
+
+  if (isPreparingToQuit) {
+    if (isDev) {
+      forceExitForShutdown("quit was requested again while shutdown was still in progress");
+      return;
+    }
+
+    scheduleForceExitForShutdown("shutdown did not finish after a repeated quit request");
     return;
   }
 
   isPreparingToQuit = true;
+  scheduleForceExitForShutdown("shutdown did not finish before the force-exit deadline");
   void (async () => {
     try {
-      await stopActiveBenchPackRunsForShutdown();
+      await stopActiveBenchPackRunsForShutdown({
+        timeoutMs: GRACEFUL_SHUTDOWN_TIMEOUT_MS
+      });
+      await agentServer.stop();
     } catch (error) {
       console.error("[benchlocal] failed to stop active Bench Pack runs during shutdown", error);
     } finally {
@@ -238,8 +279,8 @@ async function createMainWindow(): Promise<void> {
     }
   });
 
-  window.webContents.on("console-message", (_event, level, message) => {
-    console.log(`[renderer:${level}] ${message}`);
+  window.webContents.on("console-message", (details) => {
+    console.log(`[renderer:${details.level}] ${details.message}`);
   });
 
   window.once("ready-to-show", () => {
@@ -284,6 +325,15 @@ async function createMainWindow(): Promise<void> {
     });
   });
 
+  window.on("close", (event) => {
+    if (!isDev || !isMac || isQuittingAfterBenchPackShutdown) {
+      return;
+    }
+
+    event.preventDefault();
+    requestAppQuit();
+  });
+
   if (!isDev) {
     window.webContents.on("before-input-event", (event, input) => {
       const isReloadShortcut =
@@ -322,6 +372,7 @@ app.whenReady().then(async () => {
     ...(appMetadata.copyright ? { copyright: appMetadata.copyright } : {})
   });
   registerIpcHandlers();
+  await agentServer.initialize();
   initializeAppUpdater();
   buildApplicationMenu(appMetadata.productName);
   await createMainWindow();
@@ -343,10 +394,18 @@ app.on("before-quit", (event) => {
 });
 
 app.on("window-all-closed", () => {
-  if (!isMac) {
+  if (!isMac || isDev) {
     app.quit();
   }
 });
+
+app.on("will-quit", clearForceQuitTimer);
+app.on("quit", clearForceQuitTimer);
+
+if (isDev) {
+  process.on("SIGINT", requestAppQuit);
+  process.on("SIGTERM", requestAppQuit);
+}
 
 if (isDev) {
   process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = "true";

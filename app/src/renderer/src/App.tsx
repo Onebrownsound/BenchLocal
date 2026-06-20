@@ -1,5 +1,8 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import benchlocalIcon from "../../../assets/benchlocal-icon.png";
+import benchlocalIconOutline from "../../../assets/benchlocal-icon-outline.png";
+import shareCardDisplayFontUrl from "./assets/fonts/InterVariable.woff2";
+import shareCardMonoFontUrl from "./assets/fonts/JetBrainsMonoVariable.woff2";
 import {
   ArrowRight,
   ArrowUp,
@@ -22,6 +25,7 @@ import {
   Plus,
   RotateCcw,
   Save,
+  Share2,
   Square,
   Server,
   Sidebar,
@@ -31,7 +35,11 @@ import {
   X
 } from "lucide-react";
 import type {
+  ArtifactRef,
+  BenchLocalChatRequest,
+  BenchLocalChatStreamEvent,
   BenchPackRegistryEntry,
+  BenchLocalAgentAccess,
   BenchLocalConfig,
   BenchLocalExecutionMode,
   BenchLocalModelConfig,
@@ -45,8 +53,10 @@ import type {
   BenchLocalWorkspaceTab,
   BenchLocalWorkspaceTabModelSelection,
   GenerationRequest,
+  ModelAvailability,
   ProgressEvent,
   ScenarioResult,
+  WebBenchPackHistoryPayload,
   BenchPackInspection,
   BenchPackManifest,
   BenchPackRunHistoryEntry,
@@ -55,6 +65,7 @@ import type {
 } from "@core";
 import type {
   BenchLocalAppMetadata,
+  BenchLocalAgentAccessState,
   BenchLocalUpdateState,
   BenchPackMutationProgress,
   BenchLocalDiscoveredModel,
@@ -131,7 +142,16 @@ function formatDurationMs(durationMs?: number): string | null {
   return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
 }
 
-type SettingsTab = "providers" | "models" | "benchPacks" | "verification" | "advanced";
+type SettingsTab = "providers" | "models" | "benchPacks" | "verification" | "agent" | "advanced";
+
+type ToastTone = "success" | "danger" | "neutral" | "warning";
+
+type ToastMessage = {
+  id: string;
+  tone: ToastTone;
+  message: string;
+  dedupeKey: string;
+};
 
 type LoadState = {
   path: string;
@@ -161,6 +181,7 @@ type ProviderModalState =
     };
 
 type ModelFormState = {
+  id: string;
   provider: string;
   model: string;
   label: string;
@@ -195,6 +216,7 @@ type DetailModalState = {
   runId: string | null;
   benchPackId: string;
   modelId: string;
+  modelLabel?: string;
   scenarioId: string;
   summary: string;
   rawLog: string;
@@ -218,6 +240,11 @@ type SamplingFormState = {
   presence_penalty: string;
   request_timeout_seconds: string;
 };
+
+type NumericGenerationRequestKey = {
+  [Key in keyof GenerationRequest]: GenerationRequest[Key] extends number | undefined ? Key : never;
+}[keyof GenerationRequest];
+type SamplingFieldKey = Extract<keyof SamplingFormState, NumericGenerationRequestKey>;
 
 type SamplingModalState = {
   tabId: string;
@@ -277,6 +304,15 @@ type ResolvedTabModel = BenchLocalModelConfig & {
   alias?: string;
 };
 
+type ModelAvailabilityView = ModelAvailability | {
+  modelId: string;
+  providerId: string;
+  status: "checking" | "unknown";
+  reason?: ModelAvailability["reason"];
+  details?: string;
+  checkedAt?: string;
+};
+
 type LiveRunState = {
   runId?: string;
   events: ProgressEvent[];
@@ -318,9 +354,66 @@ type BenchPackRunBlocker = {
   actionLabel: string;
 };
 
+type ShareCardStatusCounts = {
+  pass: number;
+  partial: number;
+  fail: number;
+};
+
+type ResultShareCardData = {
+  benchPackName: string;
+  modelLabel: string;
+  providerName: string;
+  modelIdentifier: string;
+  scoreValue: string;
+  scenarioCount: number;
+  completedCount: number;
+  statusCounts: ShareCardStatusCounts;
+  categories: Array<{ id: string; label: string; score: string }>;
+  runModeLabel: string;
+  runsPerTest: number;
+  runDateLabel: string;
+  durationLabel: string | null;
+  footerLabel: string;
+  outcomeLabel: string;
+  fileName: string;
+};
+
 type BenchPackMutationState = BenchPackMutationProgress;
 const THIRD_PARTY_INSTALL_MUTATION_ID = "__third_party_install__";
 const DEFAULT_BENCHLOCAL_GENERATION: GenerationRequest = { request_timeout_seconds: 300 };
+const BENCHLOCAL_WEB_BRIDGE_VERSION = 1 as const;
+const BENCHLOCAL_WEB_PACK_MESSAGE_SOURCE = "benchlocal-web-pack" as const;
+const BENCHLOCAL_WEB_HOST_MESSAGE_SOURCE = "benchlocal-host" as const;
+const SHARE_CARD_WIDTH = 1200;
+const SHARE_CARD_HEIGHT = 630;
+const SHARE_CARD_EXPORT_SCALE = 2;
+const SHARE_CARD_PIXEL_WIDTH = SHARE_CARD_WIDTH * SHARE_CARD_EXPORT_SCALE;
+const SHARE_CARD_PIXEL_HEIGHT = SHARE_CARD_HEIGHT * SHARE_CARD_EXPORT_SCALE;
+const SHARE_CARD_DISPLAY_FONT_FAMILY = "BenchLocal Share Inter";
+const SHARE_CARD_MONO_FONT_FAMILY = "BenchLocal Share JetBrains Mono";
+
+type WebBridgeMethod =
+  | "capabilities"
+  | "models.list"
+  | "models.getSelected"
+  | "inference.chat"
+  | "inference.streamChat"
+  | "runs.startState"
+  | "runs.stopState"
+  | "runs.updateProgress"
+  | "history.load"
+  | "history.save"
+  | "history.writeArtifact";
+
+type WebPackBridgeRequest = {
+  source: typeof BENCHLOCAL_WEB_PACK_MESSAGE_SOURCE;
+  bridgeVersion: typeof BENCHLOCAL_WEB_BRIDGE_VERSION;
+  requestId: string;
+  streamId?: string;
+  method: WebBridgeMethod;
+  payload?: unknown;
+};
 
 function isAbortLikeError(error: unknown): boolean {
   return error instanceof Error && /abort|cancel/i.test(error.name + " " + error.message);
@@ -371,11 +464,12 @@ const SETTINGS_TABS: Array<{ id: SettingsTab; label: string; blurb: string; icon
   { id: "providers", label: "Providers", blurb: "Provider endpoints and credentials.", icon: <Server size={16} /> },
   { id: "models", label: "Models", blurb: "Shared model registry across Bench Packs.", icon: <Bot size={16} /> },
   { id: "benchPacks", label: "Bench Packs", blurb: "Browse, install, update, and remove official Bench Packs.", icon: <PlugZap size={16} /> },
-  { id: "verification", label: "Verification", blurb: "Managed verifiers and dependency modes.", icon: <Wrench size={16} /> }
+  { id: "verification", label: "Verification", blurb: "Managed verifiers and dependency modes.", icon: <Wrench size={16} /> },
+  { id: "agent", label: "Agent Access", blurb: "Local API and live event stream for AI agents.", icon: <Server size={16} /> }
 ];
 
 const SAMPLING_FIELDS: Array<{
-  key: keyof SamplingFormState;
+  key: SamplingFieldKey;
   label: string;
   placeholder: string;
   integer?: boolean;
@@ -422,6 +516,684 @@ function providerKindLabel(kind: BenchLocalProviderKind): string {
 
 function defaultProviderName(kind: BenchLocalProviderKind): string {
   return providerKindLabel(kind);
+}
+
+function fallbackProviderDisplayName(providerId: string): string {
+  const trimmed = providerId.trim();
+
+  if (/^openai[_-]compatible-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed)) {
+    return "OpenAI Compatible";
+  }
+
+  switch (trimmed) {
+    case "openrouter":
+      return "OpenRouter";
+    case "huggingface":
+      return "Hugging Face";
+    case "ollama":
+      return "Ollama";
+    case "llamacpp":
+      return "llama.cpp";
+    case "mlx":
+      return "MLX";
+    case "lmstudio":
+      return "LM Studio";
+    case "pico":
+      return "Pico";
+    default:
+      return trimmed || "Unknown Provider";
+  }
+}
+
+function getProviderDisplayName(
+  providers: Record<string, BenchLocalProviderConfig>,
+  providerId: string
+): string {
+  return providers[providerId]?.name?.trim() || fallbackProviderDisplayName(providerId);
+}
+
+function getModelDisplayIdentifier(model: Pick<BenchLocalModelConfig, "id" | "model">): string {
+  return model.model.trim() || model.id.split(":").slice(1).join(":").trim() || model.id;
+}
+
+function getModelLabelForMessage(modelId: string, models: ResolvedTabModel[]): string {
+  const model = models.find((candidate) => candidate.id === modelId);
+  return model?.displayLabel ?? model?.label ?? (modelId.split(":").slice(1).join(":").trim() || modelId);
+}
+
+function formatShareScore(value: number): string {
+  if (!Number.isFinite(value)) {
+    return "0";
+  }
+
+  if (Number.isInteger(value)) {
+    return `${value}`;
+  }
+
+  return value.toFixed(2).replace(/\.?0+$/u, "");
+}
+
+function formatShareDate(value: string): string {
+  const date = new Date(value);
+
+  if (Number.isNaN(date.valueOf())) {
+    return "Unknown date";
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(date);
+}
+
+function sanitizeShareFileName(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, "-")
+    .replace(/^-+|-+$/gu, "")
+    .slice(0, 80) || "benchlocal-result";
+}
+
+function countShareStatuses(results: ScenarioResult[], scenarioCount: number): ShareCardStatusCounts {
+  const counts: ShareCardStatusCounts = {
+    pass: 0,
+    partial: 0,
+    fail: 0
+  };
+
+  for (const result of results) {
+    if (isProviderErrorResult(result)) {
+      counts.fail += 1;
+    } else if (result.status === "pass") {
+      counts.pass += 1;
+    } else if (result.status === "partial") {
+      counts.partial += 1;
+    } else {
+      counts.fail += 1;
+    }
+  }
+
+  counts.fail += Math.max(0, scenarioCount - results.length);
+  return counts;
+}
+
+function describeShareOutcome(counts: ShareCardStatusCounts, scenarioCount: number): string {
+  if (scenarioCount > 0 && counts.pass === scenarioCount) {
+    return "All passed";
+  }
+
+  if (counts.fail > 0) {
+    return `${counts.fail} failed`;
+  }
+
+  if (counts.partial > 0) {
+    return `${counts.partial} partial`;
+  }
+
+  return "Completed";
+}
+
+function buildResultShareCardData({
+  runSummary,
+  model,
+  providers,
+  score,
+  runModeLabel
+}: {
+  runSummary: BenchPackRunSummary;
+  model: ResolvedTabModel | undefined;
+  providers: Record<string, BenchLocalProviderConfig>;
+  score: BenchPackRunSummary["scores"][string];
+  runModeLabel: string;
+}): ResultShareCardData {
+  const modelId = model?.id ?? "model";
+  const results = runSummary.resultsByModel[modelId] ?? [];
+  const scenarioCount = runSummary.scenarioCount;
+  const statusCounts = countShareStatuses(results, scenarioCount);
+  const providerName = model ? getProviderDisplayName(providers, model.provider) : "Unknown Provider";
+  const modelIdentifier = model ? getModelDisplayIdentifier(model) : modelId;
+  const startedAt = new Date(runSummary.startedAt);
+  const completedAt = new Date(runSummary.completedAt);
+  const durationLabel =
+    Number.isNaN(startedAt.valueOf()) || Number.isNaN(completedAt.valueOf())
+      ? null
+      : formatDurationMs(Math.max(0, completedAt.valueOf() - startedAt.valueOf()));
+  const benchPackName = runSummary.benchPackName || runSummary.benchPackId;
+  const modelLabel = model?.displayLabel ?? model?.label ?? modelIdentifier;
+
+  return {
+    benchPackName,
+    modelLabel,
+    providerName,
+    modelIdentifier,
+    scoreValue: formatShareScore(score.totalScore),
+    scenarioCount,
+    completedCount: results.length,
+    statusCounts,
+    categories: score.categories.map((category) => ({
+      id: category.id,
+      label: category.label,
+      score: formatShareScore(category.score)
+    })),
+    runModeLabel,
+    runsPerTest: normalizeRunsPerTest(runSummary.runsPerTest),
+    runDateLabel: formatShareDate(runSummary.startedAt),
+    durationLabel,
+    footerLabel: "benchlocal.com",
+    outcomeLabel: describeShareOutcome(statusCounts, scenarioCount),
+    fileName: `${sanitizeShareFileName(`benchlocal-${benchPackName}-${modelLabel}`)}.png`
+  };
+}
+
+function drawRoundedRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  radius: number
+): void {
+  const r = Math.min(radius, width / 2, height / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + width - r, y);
+  ctx.quadraticCurveTo(x + width, y, x + width, y + r);
+  ctx.lineTo(x + width, y + height - r);
+  ctx.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+  ctx.lineTo(x + r, y + height);
+  ctx.quadraticCurveTo(x, y + height, x, y + height - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function fillRoundedRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  radius: number,
+  color: string
+): void {
+  drawRoundedRect(ctx, x, y, width, height, radius);
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+
+function strokeRoundedRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  radius: number,
+  color: string,
+  lineWidth = 1
+): void {
+  drawRoundedRect(ctx, x, y, width, height, radius);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth;
+  ctx.stroke();
+}
+
+let shareCardLogoImagePromise: Promise<HTMLImageElement | null> | null = null;
+let shareCardFontsPromise: Promise<void> | null = null;
+
+function loadShareCardLogoImage(): Promise<HTMLImageElement | null> {
+  shareCardLogoImagePromise ??= new Promise((resolve) => {
+    const image = new Image();
+    let settled = false;
+    const finish = (value: HTMLImageElement | null) => {
+      if (!settled) {
+        settled = true;
+        resolve(value);
+      }
+    };
+
+    image.onload = () => finish(image);
+    image.onerror = () => finish(null);
+    image.src = benchlocalIconOutline;
+
+    if (image.complete && image.naturalWidth > 0) {
+      finish(image);
+    }
+  });
+
+  return shareCardLogoImagePromise;
+}
+
+function loadShareCardFonts(): Promise<void> {
+  if (typeof document === "undefined" || typeof FontFace === "undefined") {
+    return Promise.resolve();
+  }
+
+  shareCardFontsPromise ??= Promise.all([
+    {
+      family: SHARE_CARD_DISPLAY_FONT_FAMILY,
+      url: shareCardDisplayFontUrl
+    },
+    {
+      family: SHARE_CARD_MONO_FONT_FAMILY,
+      url: shareCardMonoFontUrl
+    }
+  ].map(async ({ family, url }) => {
+    if (document.fonts.check(`16px "${family}"`)) {
+      return;
+    }
+
+    const font = new FontFace(family, `url("${url}") format("woff2")`, {
+      display: "block",
+      style: "normal",
+      weight: "100 900"
+    });
+    (document.fonts as FontFaceSet & { add(font: FontFace): void }).add(await font.load());
+  })).then(() => document.fonts.ready).then(() => undefined);
+
+  return shareCardFontsPromise;
+}
+
+function drawShareCardLogo(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  size: number,
+  logoImage?: HTMLImageElement | null
+): void {
+  fillRoundedRect(ctx, x, y, size, size, 12, "#0f2a3d");
+
+  if (logoImage) {
+    ctx.save();
+    drawRoundedRect(ctx, x, y, size, size, 12);
+    ctx.clip();
+    ctx.drawImage(logoImage, x, y, size, size);
+    ctx.restore();
+  } else {
+    strokeRoundedRect(ctx, x + 13, y + 13, size - 26, 7, 3, "#40a9ff", 2.5);
+    strokeRoundedRect(ctx, x + 13, y + 27, size - 26, 7, 3, "#40a9ff", 2.5);
+  }
+
+  strokeRoundedRect(ctx, x, y, size, size, 12, "rgba(255, 211, 106, 0.22)", 1);
+}
+
+function truncateCanvasText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string {
+  if (ctx.measureText(text).width <= maxWidth) {
+    return text;
+  }
+
+  const suffix = "...";
+  let next = text;
+
+  while (next.length > 0 && ctx.measureText(`${next}${suffix}`).width > maxWidth) {
+    next = next.slice(0, -1);
+  }
+
+  return next ? `${next}${suffix}` : suffix;
+}
+
+function getWrappedCanvasTextLines(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  maxWidth: number,
+  maxLines: number
+): string[] {
+  const lines: string[] = [];
+  let remaining = text.trim().replace(/\s+/gu, " ");
+
+  while (remaining && lines.length < maxLines) {
+    if (ctx.measureText(remaining).width <= maxWidth) {
+      lines.push(remaining);
+      break;
+    }
+
+    if (lines.length === maxLines - 1) {
+      lines.push(truncateCanvasText(ctx, remaining, maxWidth));
+      break;
+    }
+
+    let low = 1;
+    let high = remaining.length;
+    let fit = 1;
+
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const candidate = remaining.slice(0, mid);
+
+      if (ctx.measureText(candidate).width <= maxWidth) {
+        fit = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+
+    const slice = remaining.slice(0, fit);
+    const breakMatches = [...slice.matchAll(/[ /_\-:.]/gu)];
+    const lastBreak = breakMatches.at(-1)?.index;
+    const breakIndex = lastBreak !== undefined && lastBreak > fit * 0.42 ? lastBreak + 1 : fit;
+    lines.push(remaining.slice(0, breakIndex).trimEnd());
+    remaining = remaining.slice(breakIndex).trimStart();
+  }
+
+  return lines;
+}
+
+function drawWrappedCanvasText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  x: number,
+  y: number,
+  maxWidth: number,
+  lineHeight: number,
+  maxLines: number
+): number {
+  const visibleLines = getWrappedCanvasTextLines(ctx, text, maxWidth, maxLines);
+
+  visibleLines.forEach((line, index) => {
+    ctx.fillText(line, x, y + index * lineHeight);
+  });
+
+  return y + visibleLines.length * lineHeight;
+}
+
+function drawShareCardCanvas(
+  canvas: HTMLCanvasElement,
+  data: ResultShareCardData,
+  logoImage?: HTMLImageElement | null
+): void {
+  const ctx = canvas.getContext("2d");
+
+  if (!ctx) {
+    return;
+  }
+
+  canvas.width = SHARE_CARD_PIXEL_WIDTH;
+  canvas.height = SHARE_CARD_PIXEL_HEIGHT;
+  ctx.setTransform(SHARE_CARD_EXPORT_SCALE, 0, 0, SHARE_CARD_EXPORT_SCALE, 0, 0);
+
+  const displayFont = `"${SHARE_CARD_DISPLAY_FONT_FAMILY}", sans-serif`;
+  const monoFont = `"${SHARE_CARD_MONO_FONT_FAMILY}", monospace`;
+  const palette = {
+    bg: "#030303",
+    panel: "#101010",
+    panelStrong: "#171717",
+    border: "#333333",
+    text: "#f7f7f3",
+    muted: "#b8b8ae",
+    faint: "#77776f",
+    accent: "#f4f4ec",
+    accentStrong: "#ffffff",
+    pass: "#47d16c",
+    partial: "#cfcfc7",
+    fail: "#ef6262"
+  };
+
+  const backgroundGradient = ctx.createRadialGradient(940, 70, 18, 610, 280, 820);
+  backgroundGradient.addColorStop(0, "#6a6a6a");
+  backgroundGradient.addColorStop(0.16, "#343434");
+  backgroundGradient.addColorStop(0.42, "#111111");
+  backgroundGradient.addColorStop(1, palette.bg);
+  ctx.fillStyle = backgroundGradient;
+  ctx.fillRect(0, 0, SHARE_CARD_WIDTH, SHARE_CARD_HEIGHT);
+  const upperGlow = ctx.createRadialGradient(846, 88, 8, 846, 88, 410);
+  upperGlow.addColorStop(0, "rgba(255, 255, 255, 0.18)");
+  upperGlow.addColorStop(0.36, "rgba(255, 255, 255, 0.055)");
+  upperGlow.addColorStop(1, "rgba(255, 255, 255, 0)");
+  ctx.fillStyle = upperGlow;
+  ctx.fillRect(0, 0, SHARE_CARD_WIDTH, SHARE_CARD_HEIGHT);
+  const lowerGlow = ctx.createRadialGradient(278, 542, 18, 278, 542, 540);
+  lowerGlow.addColorStop(0, "rgba(255, 255, 255, 0.10)");
+  lowerGlow.addColorStop(0.46, "rgba(255, 255, 255, 0.024)");
+  lowerGlow.addColorStop(1, "rgba(255, 255, 255, 0)");
+  ctx.fillStyle = lowerGlow;
+  ctx.fillRect(0, 0, SHARE_CARD_WIDTH, SHARE_CARD_HEIGHT);
+
+  const panelX = 36;
+  const panelY = 36;
+  const panelWidth = SHARE_CARD_WIDTH - 72;
+  const panelHeight = SHARE_CARD_HEIGHT - 72;
+  ctx.save();
+  drawRoundedRect(ctx, panelX, panelY, panelWidth, panelHeight, 34);
+  ctx.clip();
+  const panelGradient = ctx.createRadialGradient(880, 76, 80, 540, 324, 760);
+  panelGradient.addColorStop(0, "#3a3a3a");
+  panelGradient.addColorStop(0.22, "#1f1f1f");
+  panelGradient.addColorStop(0.52, palette.panel);
+  panelGradient.addColorStop(1, "#070707");
+  ctx.fillStyle = panelGradient;
+  ctx.fillRect(panelX, panelY, panelWidth, panelHeight);
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.045)";
+  ctx.lineWidth = 1;
+  for (let x = panelX + 58; x < panelX + panelWidth; x += 64) {
+    ctx.beginPath();
+    ctx.moveTo(x, panelY);
+    ctx.lineTo(x, panelY + panelHeight);
+    ctx.stroke();
+  }
+  for (let y = panelY + 58; y < panelY + panelHeight; y += 64) {
+    ctx.beginPath();
+    ctx.moveTo(panelX, y);
+    ctx.lineTo(panelX + panelWidth, y);
+    ctx.stroke();
+  }
+  ctx.restore();
+  strokeRoundedRect(ctx, panelX, panelY, panelWidth, panelHeight, 34, "rgba(255, 255, 255, 0.26)", 1.5);
+  ctx.fillStyle = palette.accent;
+  ctx.fillRect(36, 146, 7, 400);
+  ctx.beginPath();
+  ctx.moveTo(36, 546);
+  ctx.lineTo(SHARE_CARD_WIDTH - 36, 546);
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.22)";
+  ctx.lineWidth = 0.55;
+  ctx.stroke();
+
+  drawShareCardLogo(ctx, 78, 65, 44, logoImage);
+
+  ctx.font = `800 34px ${displayFont}`;
+  ctx.fillStyle = palette.text;
+  ctx.textBaseline = "middle";
+  ctx.fillText("BenchLocal", 136, 87);
+  ctx.textBaseline = "alphabetic";
+
+  ctx.font = `900 22px ${monoFont}`;
+  const packLabel = truncateCanvasText(ctx, data.benchPackName.toUpperCase(), 360);
+  const packWidth = Math.max(190, ctx.measureText(packLabel).width + 58);
+  const packX = SHARE_CARD_WIDTH - 78 - packWidth;
+  fillRoundedRect(ctx, packX, 62, packWidth, 48, 24, palette.panelStrong);
+  strokeRoundedRect(ctx, packX, 62, packWidth, 48, 24, palette.border, 1);
+  ctx.fillStyle = palette.accentStrong;
+  ctx.textAlign = "center";
+  ctx.fillText(packLabel, packX + packWidth / 2, 94);
+  ctx.textAlign = "left";
+
+  ctx.font = `900 70px ${displayFont}`;
+  ctx.fillStyle = palette.text;
+  drawWrappedCanvasText(ctx, data.modelLabel, 78, 205, 970, 76, 2);
+
+  fillRoundedRect(ctx, 78, 356, 350, 164, 26, palette.panelStrong);
+  strokeRoundedRect(ctx, 78, 356, 350, 164, 26, "rgba(255, 255, 255, 0.18)", 1.5);
+  ctx.font = `800 18px ${monoFont}`;
+  ctx.fillStyle = palette.accentStrong;
+  ctx.fillText("SCORE", 110, 394);
+  ctx.font = `760 24px ${displayFont}`;
+  ctx.fillStyle = palette.muted;
+  ctx.fillText(`${data.completedCount}/${data.scenarioCount}`, 110, 430);
+  const scorePanelTop = 356;
+  const scorePanelHeight = 164;
+  const scoreTextMaxWidth = 188;
+  let scoreFontSize = 142;
+  let scoreMetrics: TextMetrics;
+  let scoreTextAscent = 0;
+  let scoreTextDescent = 0;
+  do {
+    ctx.font = `900 ${scoreFontSize}px ${displayFont}`;
+    scoreMetrics = ctx.measureText(data.scoreValue);
+    scoreTextAscent = scoreMetrics.actualBoundingBoxAscent || scoreFontSize * 0.72;
+    scoreTextDescent = scoreMetrics.actualBoundingBoxDescent || scoreFontSize * 0.22;
+    if (scoreMetrics.width <= scoreTextMaxWidth && scoreTextAscent + scoreTextDescent <= scorePanelHeight - 26) {
+      break;
+    }
+    scoreFontSize -= 2;
+  } while (scoreFontSize > 90);
+  const scoreTextCenterY = scorePanelTop + scorePanelHeight / 2;
+  const scoreBaselineY = scoreTextCenterY + (scoreTextAscent - scoreTextDescent) / 2;
+  ctx.fillStyle = palette.text;
+  ctx.textAlign = "right";
+  ctx.fillText(data.scoreValue, 396, scoreBaselineY);
+  ctx.textAlign = "left";
+
+  const segments = [
+    { label: "Pass", count: data.statusCounts.pass, color: palette.pass },
+    { label: "Partial", count: data.statusCounts.partial, color: palette.partial },
+    { label: "Fail", count: data.statusCounts.fail, color: palette.fail }
+  ];
+  const barX = 480;
+  const barY = 356;
+  const barWidth = 636;
+  const barHeight = 20;
+  fillRoundedRect(ctx, barX, barY, barWidth, barHeight, 10, "#242424");
+
+  let offset = 0;
+  const total = Math.max(1, data.scenarioCount);
+  for (const segment of segments) {
+    if (segment.count <= 0) {
+      continue;
+    }
+
+    const segmentWidth = Math.max(segment.count > 0 ? 5 : 0, Math.round((segment.count / total) * barWidth));
+    const visibleWidth = Math.max(0, Math.min(segmentWidth, barWidth - offset));
+    ctx.fillStyle = segment.color;
+    ctx.fillRect(barX + offset, barY, visibleWidth, barHeight);
+    offset += segmentWidth;
+  }
+
+  strokeRoundedRect(ctx, barX, barY, barWidth, barHeight, 10, "rgba(255, 255, 255, 0.12)", 1);
+
+  ctx.font = `760 18px ${displayFont}`;
+  let legendX = barX;
+  for (const segment of segments) {
+    const label = `${segment.label} ${segment.count}`;
+    const labelWidth = ctx.measureText(label).width;
+    fillRoundedRect(ctx, legendX, 394, 14, 14, 4, segment.color);
+    ctx.fillStyle = palette.muted;
+    ctx.fillText(label, legendX + 22, 408);
+    legendX += labelWidth + 52;
+  }
+
+  ctx.font = `800 17px ${monoFont}`;
+  ctx.fillStyle = palette.faint;
+  ctx.fillText("CATEGORY BREAKDOWN", 480, 462);
+
+  ctx.font = `760 20px ${displayFont}`;
+  const chipStartX = 480;
+  const chipAreaWidth = 636;
+  const chipRows = [472, 508];
+  const chipGap = 9;
+  const chipHeight = 30;
+  const chipPaddingX = 28;
+  const chipMinWidth = 78;
+  const chipMaxWidth = 220;
+  const measureCategoryChipWidth = (label: string) =>
+    Math.min(chipMaxWidth, Math.max(chipMinWidth, Math.ceil(ctx.measureText(label).width) + chipPaddingX));
+  const layoutCategoryChips = (chips: Array<{ label: string; overflow: boolean }>) => {
+    const layouts: Array<{ label: string; overflow: boolean; x: number; y: number; width: number }> = [];
+    let row = 0;
+    let x = chipStartX;
+
+    for (const chip of chips) {
+      const width = measureCategoryChipWidth(chip.label);
+
+      if (x > chipStartX && x + width > chipStartX + chipAreaWidth) {
+        row += 1;
+        x = chipStartX;
+      }
+
+      if (row >= chipRows.length) {
+        return null;
+      }
+
+      layouts.push({
+        ...chip,
+        x,
+        y: chipRows[row],
+        width
+      });
+      x += width + chipGap;
+    }
+
+    return layouts;
+  };
+
+  let visibleCategoryCount = data.categories.length;
+  let categoryChipLayouts: ReturnType<typeof layoutCategoryChips> = null;
+
+  while (visibleCategoryCount >= 0 && !categoryChipLayouts) {
+    const categoryChips = data.categories.slice(0, visibleCategoryCount).map((category) => ({
+      label: `${category.id}: ${category.score}`,
+      overflow: false
+    }));
+
+    if (visibleCategoryCount < data.categories.length) {
+      categoryChips.push({
+        label: `+${data.categories.length - visibleCategoryCount} more`,
+        overflow: true
+      });
+    }
+
+    categoryChipLayouts = layoutCategoryChips(categoryChips);
+    visibleCategoryCount -= 1;
+  }
+
+  const drawCategoryChip = (label: string, x: number, y: number, width: number, overflow = false) => {
+    fillRoundedRect(ctx, x, y, width, chipHeight, 15, overflow ? "#202020" : "#181818");
+    strokeRoundedRect(ctx, x, y, width, chipHeight, 15, "rgba(255, 255, 255, 0.14)", 1);
+    ctx.fillStyle = overflow ? palette.accentStrong : palette.text;
+    ctx.fillText(label, x + 14, y + 21);
+  };
+
+  categoryChipLayouts?.forEach((chip) => {
+    const label = truncateCanvasText(ctx, chip.label, chip.width - chipPaddingX);
+    drawCategoryChip(label, chip.x, chip.y, chip.width, chip.overflow);
+  });
+
+  ctx.font = `700 18px ${displayFont}`;
+  ctx.fillStyle = palette.muted;
+  const meta = [
+    data.runModeLabel,
+    `${data.runsPerTest}x run${data.runsPerTest === 1 ? "" : "s"}`,
+    data.runDateLabel,
+    data.durationLabel ? `${data.durationLabel} total` : null
+  ].filter(Boolean).join(" · ");
+  ctx.textBaseline = "middle";
+  ctx.fillText(truncateCanvasText(ctx, meta, 760), 78, 570);
+
+  ctx.font = `800 18px ${monoFont}`;
+  ctx.fillStyle = palette.accentStrong;
+  ctx.textAlign = "right";
+  ctx.fillText(data.footerLabel, SHARE_CARD_WIDTH - 78, 570);
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+}
+
+async function createShareCardBlob(data: ResultShareCardData): Promise<Blob> {
+  const canvas = document.createElement("canvas");
+  const [, logoImage] = await Promise.all([loadShareCardFonts(), loadShareCardLogoImage()]);
+  drawShareCardCanvas(canvas, data, logoImage);
+
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        reject(new Error("Could not render share card."));
+        return;
+      }
+
+      resolve(blob);
+    }, "image/png");
+  });
 }
 
 function defaultProviderApiKeyPlaceholder(kind: BenchLocalProviderKind): string {
@@ -481,6 +1253,7 @@ function createEmptyProvider(): ProviderFormState {
 
 function createEmptyModel(providerId = "openrouter"): ModelFormState {
   return {
+    id: "",
     provider: providerId,
     model: "",
     label: "",
@@ -539,10 +1312,36 @@ function parseSamplingForm(form: SamplingFormState): { value?: GenerationRequest
       return { error: `${field.label} must be greater than zero.` };
     }
 
-    result[field.key as keyof GenerationRequest] = parsed;
+    result[field.key] = parsed;
   }
 
   return { value: result };
+}
+
+function isWebPackBridgeRequest(value: unknown): value is WebPackBridgeRequest {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<WebPackBridgeRequest>;
+  return (
+    candidate.source === BENCHLOCAL_WEB_PACK_MESSAGE_SOURCE &&
+    candidate.bridgeVersion === BENCHLOCAL_WEB_BRIDGE_VERSION &&
+    typeof candidate.requestId === "string" &&
+    typeof candidate.method === "string"
+  );
+}
+
+function getOriginFromUrl(value: string): string | null {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function toProviderForm(id: string, provider: BenchLocalProviderConfig): ProviderFormState {
@@ -558,6 +1357,7 @@ function toProviderForm(id: string, provider: BenchLocalProviderConfig): Provide
 
 function toModelForm(model: BenchLocalModelConfig): ModelFormState {
   return {
+    id: model.id,
     provider: model.provider,
     model: model.model,
     label: model.label,
@@ -570,17 +1370,59 @@ function buildModelConfig(
   form: ModelFormState,
   providers: Record<string, BenchLocalProviderConfig>
 ): BenchLocalModelConfig {
-  const provider = providers[form.provider.trim()];
-  const providerLabel = provider?.name?.trim() || form.provider.trim();
+  const providerLabel = getProviderDisplayName(providers, form.provider.trim());
 
   return {
-    id: `${form.provider}:${form.model}`.trim(),
+    id: form.id.trim() || `${form.provider}:${form.model}`.trim(),
     provider: form.provider.trim(),
     model: form.model.trim(),
     label: form.label.trim() || `${form.model.trim()} via ${providerLabel}`,
     group: form.group.trim() || "primary",
     enabled: form.enabled
   };
+}
+
+function createCopyLabel(label: string, existingLabels: string[]): string {
+  const base = `${label.trim() || "Untitled"} Copy`;
+  const existing = new Set(existingLabels.map((candidate) => candidate.trim()));
+
+  if (!existing.has(base)) {
+    return base;
+  }
+
+  for (let index = 2; index < 1000; index += 1) {
+    const candidate = `${base} ${index}`;
+    if (!existing.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  return `${base} ${crypto.randomUUID().slice(0, 8)}`;
+}
+
+function createUniqueProviderId(
+  kind: BenchLocalProviderKind,
+  providers: Record<string, BenchLocalProviderConfig>
+): string {
+  let id = "";
+
+  do {
+    id = `${kind}-${crypto.randomUUID()}`;
+  } while (providers[id]);
+
+  return id;
+}
+
+function createUniqueModelId(model: BenchLocalModelConfig, models: BenchLocalModelConfig[]): string {
+  const existing = new Set(models.map((candidate) => candidate.id));
+  const modelPart = model.model.trim() || model.id.split(":").slice(1).join(":").trim() || "model";
+  let id = "";
+
+  do {
+    id = `${model.provider}:${modelPart}:copy-${crypto.randomUUID()}`;
+  } while (existing.has(id));
+
+  return id;
 }
 
 function createWorkspaceName(existingCount: number): string {
@@ -1109,6 +1951,10 @@ function isProviderErrorResult(result: ScenarioResult | undefined): boolean {
   return result?.errorType === "provider_error";
 }
 
+function isRunCancellationMessage(message: string | undefined): boolean {
+  return /run cancelled/i.test(message ?? "");
+}
+
 const REGISTRY_UNAVAILABLE_MESSAGE =
   "Official Bench Pack registry is unavailable right now. Installed Bench Packs remain usable.";
 
@@ -1235,6 +2081,60 @@ function formatVerifierRuntimeStatus(status: BenchPackVerifierStatus["verifiers"
   }
 }
 
+function getModelAvailabilityView(
+  model: ResolvedTabModel,
+  availabilityByModelId: Record<string, ModelAvailability>,
+  checkingModelIds: Record<string, true>
+): ModelAvailabilityView {
+  if (checkingModelIds[model.id]) {
+    return {
+      modelId: model.id,
+      providerId: model.provider,
+      status: "checking"
+    };
+  }
+
+  return availabilityByModelId[model.id] ?? {
+    modelId: model.id,
+    providerId: model.provider,
+    status: "unknown",
+    details: "Availability has not been checked yet."
+  };
+}
+
+function modelAvailabilityChipClass(availability: ModelAvailabilityView): string {
+  switch (availability.status) {
+    case "online":
+      return "is-online";
+    case "offline":
+      return "is-offline";
+    case "checking":
+      return "is-checking";
+    case "unknown":
+    default:
+      return "is-unknown";
+  }
+}
+
+function modelAvailabilityLabel(availability: ModelAvailabilityView): string {
+  switch (availability.status) {
+    case "online":
+      return "online";
+    case "offline":
+      return "offline";
+    case "checking":
+      return "checking";
+    case "unknown":
+    default:
+      return "unknown";
+  }
+}
+
+function modelAvailabilityTitle(availability: ModelAvailabilityView): string {
+  const label = modelAvailabilityLabel(availability);
+  return availability.details ? `${label}: ${availability.details}` : label;
+}
+
 export function App() {
   if (DETACHED_LOGS_VIEW) {
     return <DetachedLogsWindow />;
@@ -1267,6 +2167,7 @@ export function App() {
   const [aboutDialogOpen, setAboutDialogOpen] = useState(false);
   const [appMetadata, setAppMetadata] = useState<BenchLocalAppMetadata | null>(null);
   const [appUpdateState, setAppUpdateState] = useState<BenchLocalUpdateState | null>(null);
+  const [agentAccessState, setAgentAccessState] = useState<BenchLocalAgentAccessState | null>(null);
   const [dismissedDownloadedUpdateVersion, setDismissedDownloadedUpdateVersion] = useState<string | null>(null);
   const [providerModal, setProviderModal] = useState<ProviderModalState | null>(null);
   const [modelModal, setModelModal] = useState<ModelModalState | null>(null);
@@ -1291,6 +2192,8 @@ export function App() {
   const [liveRuns, setLiveRuns] = useState<Record<string, LiveRunState>>({});
   const [liveScenarioFocus, setLiveScenarioFocus] = useState<Record<string, LiveScenarioFocusState>>({});
   const [loadedHistoryRuns, setLoadedHistoryRuns] = useState<Record<string, LoadedHistoryEntry>>({});
+  const [modelAvailabilityById, setModelAvailabilityById] = useState<Record<string, ModelAvailability>>({});
+  const [checkingModelAvailability, setCheckingModelAvailability] = useState<Record<string, true>>({});
   const [logsOpen, setLogsOpen] = useState(false);
   const [logsAutoScroll, setLogsAutoScroll] = useState(true);
   const [logsDetached, setLogsDetached] = useState(false);
@@ -1300,9 +2203,16 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [appNotice, setAppNotice] = useState<string | null>(null);
   const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
+  const [toastMessages, setToastMessages] = useState<ToastMessage[]>([]);
   const [benchPackMutations, setBenchPackMutations] = useState<Record<string, BenchPackMutationState>>({});
   const themeMenuRef = useRef<HTMLDivElement | null>(null);
   const settingsOpenRef = useRef(false);
+  const workspaceStateRef = useRef<BenchLocalWorkspaceState | null>(null);
+  const benchPackInspectionsRef = useRef<BenchPackInspection[]>([]);
+  const toastIdRef = useRef(0);
+  const toastTimersRef = useRef(new Map<string, number>());
+  const activeToastKeysRef = useRef(new Set<string>());
+  const toastKeysByIdRef = useRef(new Map<string, string>());
 
   const providerIds = useMemo(() => Object.keys(draft?.providers ?? {}), [draft]);
   const themeOptions = useMemo(() => ["system", ...availableThemes.map((theme) => theme.id)], [availableThemes]);
@@ -1363,6 +2273,10 @@ export function App() {
 
     return activeTabModels;
   }, [draft, activeLoadedHistory, activeRunSummary, activeTabModels]);
+  const activeDisplayModelIds = useMemo(
+    () => activeDisplayModels.map((model) => model.id).join("\0"),
+    [activeDisplayModels]
+  );
   const downloadedUpdateVersion = appUpdateState?.downloadedVersion ?? appUpdateState?.availableVersion ?? null;
   const showDownloadedUpdateBanner =
     appUpdateState?.status === "downloaded" && downloadedUpdateVersion !== dismissedDownloadedUpdateVersion;
@@ -1372,6 +2286,8 @@ export function App() {
   const tabStripRef = useRef<HTMLDivElement | null>(null);
   const tabChipRefs = useRef(new Map<string, HTMLButtonElement>());
   const modelDiscoveryCacheRef = useRef<Record<string, BenchLocalDiscoveredModel[]>>({});
+  const modelAvailabilityRequestRef = useRef(0);
+  const modelAvailabilityPendingRef = useRef<Record<string, number>>({});
   const replayRunTokensRef = useRef(new Map<string, symbol>());
   const appliedThemeKeysRef = useRef<string[]>([]);
   const [tabStripOverflow, setTabStripOverflow] = useState(false);
@@ -1379,6 +2295,48 @@ export function App() {
 
   const hasUnsavedChanges =
     loadState && draft ? JSON.stringify(loadState.config) !== JSON.stringify(draft) : false;
+
+  const dismissToast = useCallback((id: string) => {
+    const timer = toastTimersRef.current.get(id);
+    const dedupeKey = toastKeysByIdRef.current.get(id);
+
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      toastTimersRef.current.delete(id);
+    }
+
+    if (dedupeKey) {
+      activeToastKeysRef.current.delete(dedupeKey);
+      toastKeysByIdRef.current.delete(id);
+    }
+
+    setToastMessages((current) => current.filter((toast) => toast.id !== id));
+  }, []);
+
+  const pushToast = useCallback((message: string, tone: ToastTone = "success") => {
+    const normalizedMessage = message.trim();
+
+    if (!normalizedMessage) {
+      return;
+    }
+
+    const dedupeKey = `${tone}:${normalizedMessage}`;
+
+    if (activeToastKeysRef.current.has(dedupeKey)) {
+      return;
+    }
+
+    const id = `toast-${Date.now()}-${toastIdRef.current}`;
+    toastIdRef.current += 1;
+    activeToastKeysRef.current.add(dedupeKey);
+    toastKeysByIdRef.current.set(id, dedupeKey);
+    setToastMessages((current) => [...current, { id, tone, message: normalizedMessage, dedupeKey }]);
+
+    const timeoutMs = tone === "danger" ? 8000 : 4500;
+    const timer = window.setTimeout(() => dismissToast(id), timeoutMs);
+    toastTimersRef.current.set(id, timer);
+  }, [dismissToast]);
+
   const effectiveThemeId = useMemo(() => {
     const requested = draft?.ui.theme ?? "system";
 
@@ -1488,6 +2446,56 @@ export function App() {
     }
   };
 
+  const refreshModelAvailability = async (models: ResolvedTabModel[] = activeDisplayModels) => {
+    if (!draft || models.length === 0) {
+      return;
+    }
+
+    const modelIds = models.map((model) => model.id);
+    const requestId = modelAvailabilityRequestRef.current + 1;
+    modelAvailabilityRequestRef.current = requestId;
+    for (const modelId of modelIds) {
+      modelAvailabilityPendingRef.current[modelId] = requestId;
+    }
+    setCheckingModelAvailability((current) => ({
+      ...current,
+      ...Object.fromEntries(modelIds.map((modelId) => [modelId, true]))
+    }));
+
+    try {
+      const availability = await window.benchlocal.models.availability({
+        config: draft,
+        modelIds
+      });
+
+      setModelAvailabilityById((current) => ({
+        ...current,
+        ...Object.fromEntries(
+          availability
+            .filter((entry) => modelAvailabilityPendingRef.current[entry.modelId] === requestId)
+            .map((entry) => [entry.modelId, entry])
+        )
+      }));
+    } catch (availabilityError) {
+      if (modelIds.some((modelId) => modelAvailabilityPendingRef.current[modelId] === requestId)) {
+        setError(availabilityError instanceof Error ? availabilityError.message : "Failed to check model availability.");
+      }
+    } finally {
+      setCheckingModelAvailability((current) => {
+        const next = { ...current };
+
+        for (const modelId of modelIds) {
+          if (modelAvailabilityPendingRef.current[modelId] === requestId) {
+            delete next[modelId];
+            delete modelAvailabilityPendingRef.current[modelId];
+          }
+        }
+
+        return next;
+      });
+    }
+  };
+
   useEffect(() => {
     let cancelled = false;
 
@@ -1503,14 +2511,16 @@ export function App() {
           inspections,
           themes,
           verifierStatusList,
-          activeRunsResult
+          activeRunsResult,
+          agentState
         ] = await Promise.all([
           window.benchlocal.config.load(),
           window.benchlocal.workspaces.load(),
           window.benchlocal.benchPacks.list(),
           window.benchlocal.themes.list(),
           window.benchlocal.verifiers.list(),
-          window.benchlocal.benchPacks.activeRuns()
+          window.benchlocal.benchPacks.activeRuns(),
+          window.benchlocal.agent.state()
         ]);
 
         let registry: BenchPackRegistryEntry[] = [];
@@ -1570,6 +2580,7 @@ export function App() {
         setRegistryEntries(registry);
         setRegistryWarning(nextRegistryWarning);
         setAvailableThemes(themes);
+        setAgentAccessState(agentState);
         setVerifierStatuses(Object.fromEntries(verifierStatusList.map((status) => [status.benchPackId, status])));
         setActiveRuns(
           Object.fromEntries(activeRunsResult.map((run) => [run.tabId, { benchPackId: run.benchPackId }]))
@@ -1592,6 +2603,54 @@ export function App() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    return () => {
+      for (const timer of toastTimersRef.current.values()) {
+        window.clearTimeout(timer);
+      }
+
+      toastTimersRef.current.clear();
+      activeToastKeysRef.current.clear();
+      toastKeysByIdRef.current.clear();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!appNotice) {
+      return;
+    }
+
+    pushToast(appNotice, "success");
+    setAppNotice(null);
+  }, [appNotice, pushToast]);
+
+  useEffect(() => {
+    if (!settingsNotice) {
+      return;
+    }
+
+    pushToast(settingsNotice, "success");
+    setSettingsNotice(null);
+  }, [settingsNotice, pushToast]);
+
+  useEffect(() => {
+    if (!error) {
+      return;
+    }
+
+    pushToast(error, "danger");
+    setError(null);
+  }, [error, pushToast]);
+
+  useEffect(() => {
+    if (!showDownloadedUpdateBanner || !downloadedUpdateVersion) {
+      return;
+    }
+
+    pushToast(describeAppUpdateState(appUpdateState), "success");
+    setDismissedDownloadedUpdateVersion(downloadedUpdateVersion);
+  }, [appUpdateState, downloadedUpdateVersion, pushToast, showDownloadedUpdateBanner]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1676,7 +2735,7 @@ export function App() {
   }, [activeThemeDefinition]);
 
   useEffect(() => {
-    return window.benchlocal.benchPacks.onRunEvent(({ tabId, event }) => {
+    return window.benchlocal.benchPacks.onRunEvent(({ tabId, benchPackId, event }) => {
       if (event.type === "verifier_preparing") {
         setVerifierPreparationModal({
           tabId,
@@ -1687,6 +2746,14 @@ export function App() {
       }
 
       if (event.type === "run_finished" || event.type === "run_error") {
+        if (event.type === "run_error" && isRunCancellationMessage(event.message)) {
+          const resolvedBenchPackId = benchPackId ?? workspaceStateRef.current?.tabs[tabId]?.benchPackId ?? "";
+          const benchPackName = resolvedBenchPackId
+            ? createTabTitle(resolvedBenchPackId, benchPackInspectionsRef.current)
+            : "Bench Pack run";
+          setAppNotice(`Stopped ${benchPackName}.`);
+        }
+
         setActiveRuns((current) => {
           if (!current[tabId]) {
             return current;
@@ -1704,6 +2771,25 @@ export function App() {
           const next = { ...current };
           delete next[tabId];
           return next;
+        });
+      }
+
+      if (event.type === "run_started") {
+        setActiveRuns((current) => {
+          if (current[tabId]) {
+            return current;
+          }
+
+          const tabBenchPackId = workspaceStateRef.current?.tabs[tabId]?.benchPackId;
+
+          if (!tabBenchPackId) {
+            return current;
+          }
+
+          return {
+            ...current,
+            [tabId]: { benchPackId: tabBenchPackId, mode: "host" }
+          };
         });
       }
 
@@ -1737,6 +2823,91 @@ export function App() {
           };
         });
       }
+    });
+  }, []);
+
+  useEffect(() => {
+    workspaceStateRef.current = workspaceState;
+  }, [workspaceState]);
+
+  useEffect(() => {
+    benchPackInspectionsRef.current = benchPackInspections;
+  }, [benchPackInspections]);
+
+  useEffect(() => {
+    const loadUpdatedConfig = async () => {
+      try {
+        const result = await window.benchlocal.config.load();
+        setLoadState(result);
+        setDraft(cloneConfig(result.config));
+        await loadBenchPackInspections();
+        await loadRegistryEntries();
+      } catch (configError) {
+        setError(configError instanceof Error ? configError.message : "Failed to reload BenchLocal config.");
+      }
+    };
+
+    return window.benchlocal.config.onUpdated(() => {
+      void loadUpdatedConfig();
+    });
+  }, []);
+
+  useEffect(() => {
+    const loadUpdatedWorkspace = async (state: BenchLocalWorkspaceState) => {
+      setWorkspaceState(state);
+      const persistedRunEntries = await Promise.all(
+        Object.values(state.tabs)
+          .filter((tab) => tab.benchPackId && tab.loadedRunId)
+          .map(async (tab) => {
+            try {
+              const summary = await window.benchlocal.benchPacks.loadHistory({
+                benchPackId: tab.benchPackId as string,
+                runId: tab.loadedRunId as string
+              });
+              return [tab.id, summary] as const;
+            } catch {
+              return null;
+            }
+          })
+      );
+
+      setRunSummaries((current) => ({
+        ...current,
+        ...Object.fromEntries(
+          persistedRunEntries.filter(
+            (entry): entry is readonly [string, BenchPackRunSummary] => entry !== null
+          )
+        )
+      }));
+      setLoadedHistoryRuns((current) => ({
+        ...current,
+        ...Object.fromEntries(
+          persistedRunEntries
+            .filter((entry): entry is readonly [string, BenchPackRunSummary] => entry !== null)
+            .map(([tabId, summary]) => [
+              tabId,
+              {
+                runId: summary.runId,
+                startedAt: summary.startedAt,
+                mode: "history" as const
+              }
+            ])
+        )
+      }));
+    };
+
+    return window.benchlocal.workspaces.onUpdated(({ state }) => {
+      void loadUpdatedWorkspace(state);
+    });
+  }, []);
+
+  useEffect(() => {
+    void window.benchlocal.agent.state().then(setAgentAccessState).catch(() => undefined);
+
+    return window.benchlocal.agent.onState((state) => {
+      void window.benchlocal.agent.state().then(setAgentAccessState).catch(() => {
+        setAgentAccessState(state);
+      });
     });
   }, []);
 
@@ -1793,6 +2964,18 @@ export function App() {
 
     void loadHistoryForBenchPack(activeInspection.id);
   }, [activeInspection?.id, activeInspection?.status]);
+
+  useEffect(() => {
+    if (!draft || !activeInspection?.id || activeDisplayModels.length === 0) {
+      return;
+    }
+
+    if (activeTab && activeRuns[activeTab.id]) {
+      return;
+    }
+
+    void refreshModelAvailability(activeDisplayModels);
+  }, [draft, activeInspection?.id, activeDisplayModelIds, activeTab?.id]);
 
   useEffect(() => {
     const dispose = window.benchlocal.logs.onDetachedWindowClosed(() => {
@@ -2032,6 +3215,30 @@ export function App() {
     }
 
     return persistConfig(draft, { notice: "Saved ~/.benchlocal/config.toml" });
+  };
+
+  const configureAgentAccess = async (input: { enabled: boolean; access?: BenchLocalAgentAccess; port?: number }): Promise<void> => {
+    setError(null);
+
+    try {
+      const state = await window.benchlocal.agent.configure(input);
+      setAgentAccessState(state);
+      setSettingsNotice(state.enabled ? "Enabled local Agent Access." : "Disabled local Agent Access.");
+    } catch (agentError) {
+      setError(agentError instanceof Error ? agentError.message : "Failed to update Agent Access.");
+    }
+  };
+
+  const regenerateAgentToken = async (): Promise<void> => {
+    setError(null);
+
+    try {
+      const state = await window.benchlocal.agent.regenerateToken();
+      setAgentAccessState(state);
+      setSettingsNotice("Regenerated the Agent Access token.");
+    } catch (agentError) {
+      setError(agentError instanceof Error ? agentError.message : "Failed to regenerate Agent Access token.");
+    }
   };
 
   const refreshBenchPackState = async (result?: LoadState) => {
@@ -2436,9 +3643,14 @@ export function App() {
         nextTab.updatedAt = new Date().toISOString();
         return current;
       });
-      if (result.cancelled) {
-        setAppNotice(`Stopped ${result.benchPackName}.`);
-      } else {
+      if (!result.cancelled && !isRunSummaryComplete(result)) {
+        const completedCells = countStoredRunResults(result);
+        setAppNotice(
+          completedCells > 0
+            ? `Ran available models for ${result.benchPackName}. Resume after starting the remaining model servers.`
+            : `No selected models are online for ${result.benchPackName}. Start a model server, then resume this test.`
+        );
+      } else if (!result.cancelled) {
         setAppNotice(`Completed ${result.benchPackName} across ${result.scenarioCount} scenarios and ${result.modelCount} model${result.modelCount === 1 ? "" : "s"}.`);
       }
       await loadBenchPackInspections();
@@ -2611,9 +3823,7 @@ export function App() {
         nextTab.updatedAt = new Date().toISOString();
         return current;
       });
-      if (result.cancelled) {
-        setAppNotice(`Stopped ${result.benchPackName}.`);
-      } else {
+      if (!result.cancelled) {
         setAppNotice(
           isRunSummaryComplete(result)
             ? `Completed ${result.benchPackName} across ${result.scenarioCount} scenarios and ${result.modelCount} model${result.modelCount === 1 ? "" : "s"}.`
@@ -2848,7 +4058,7 @@ export function App() {
         return;
       }
 
-      setAppNotice("Stopping Bench Pack run...");
+      // The host emits the final cancellation event; use that as the single stop notification.
     } catch (stopError) {
       setStoppingRuns((current) => {
         const next = { ...current };
@@ -3472,7 +4682,7 @@ export function App() {
         }));
       }
       await loadHistoryForBenchPack(detail.benchPackId);
-      setAppNotice(`Retested ${detail.scenarioId} for ${detail.modelId}.`);
+      setAppNotice(`Retested ${detail.scenarioId} for ${detail.modelLabel ?? detail.modelId}.`);
     } catch (retryError) {
       setLiveRuns((current) => {
         const existing = current[detail.tabId];
@@ -3559,7 +4769,7 @@ export function App() {
           generation: tab.samplingOverrides
         });
       } catch (retryError) {
-        failures.push(`${cell.modelId} / ${cell.scenarioId}`);
+        failures.push(`${getModelLabelForMessage(cell.modelId, models)} / ${cell.scenarioId}`);
       }
     };
 
@@ -3646,11 +4856,18 @@ export function App() {
     });
   };
 
-  const clearLoadedHistoryForBenchPack = (benchPackId: string) => {
+  const clearLoadedHistoryForBenchPack = (benchPackId: string, runIds?: Set<string>) => {
     const affectedTabIds =
       workspaceState
         ? Object.values(workspaceState.tabs)
-            .filter((tab) => tab.benchPackId === benchPackId && Boolean(loadedHistoryRuns[tab.id]))
+            .filter((tab) => {
+              const loadedRun = loadedHistoryRuns[tab.id];
+              if (tab.benchPackId !== benchPackId || !loadedRun) {
+                return false;
+              }
+
+              return !runIds || runIds.has(loadedRun.runId);
+            })
             .map((tab) => tab.id)
         : [];
 
@@ -3698,18 +4915,71 @@ export function App() {
     });
   };
 
-  const removeAllHistoryForBenchPack = async (benchPackId: string, benchPackName: string) => {
+  const handleWebPackRunSummarySaved = async (tabId: string, summary: BenchPackRunSummary) => {
+    setRunSummaries((current) => ({
+      ...current,
+      [tabId]: summary
+    }));
+
+    if (loadedHistoryRuns[tabId]) {
+      updateWorkspaceState((current) => {
+        const tab = current.tabs[tabId];
+
+        if (!tab) {
+          return current;
+        }
+
+        tab.loadedRunId = summary.runId;
+        tab.updatedAt = new Date().toISOString();
+        return current;
+      });
+    }
+
+    setLoadedHistoryRuns((current) => {
+      const existing = current[tabId];
+
+      if (!existing) {
+        return current;
+      }
+
+      return {
+        ...current,
+        [tabId]: {
+          ...existing,
+          runId: summary.runId,
+          startedAt: summary.startedAt
+        }
+      };
+    });
+    await loadHistoryForBenchPack(summary.benchPackId);
+  };
+
+  const deleteSelectedHistoryForBenchPack = async (benchPackId: string, benchPackName: string, runIds: string[]) => {
     try {
-      await window.benchlocal.benchPacks.clearHistory({ benchPackId });
+      const result = await window.benchlocal.benchPacks.deleteHistory({ benchPackId, runIds });
+      const removedRunIds = new Set(result.removedRunIds);
+
+      if (removedRunIds.size === 0) {
+        setAppNotice("No selected test histories were found.");
+        return;
+      }
+
       setRunHistories((current) => ({
         ...current,
-        [benchPackId]: []
+        [benchPackId]: (current[benchPackId] ?? []).filter((entry) => !removedRunIds.has(entry.runId))
       }));
-      clearLoadedHistoryForBenchPack(benchPackId);
-      setHistoryModal(null);
-      setAppNotice(`Removed all test histories for ${benchPackName}.`);
+
+      setHistoryModal((current) =>
+        current?.benchPackId === benchPackId
+          ? { ...current, entries: current.entries.filter((entry) => !removedRunIds.has(entry.runId)) }
+          : current
+      );
+      clearLoadedHistoryForBenchPack(benchPackId, removedRunIds);
+      setAppNotice(
+        `Deleted ${removedRunIds.size} selected ${removedRunIds.size === 1 ? "history" : "histories"} for ${benchPackName}.`
+      );
     } catch (historyError) {
-      setError(historyError instanceof Error ? historyError.message : "Failed to remove Bench Pack history.");
+      setError(historyError instanceof Error ? historyError.message : "Failed to delete Bench Pack history.");
     }
   };
 
@@ -3750,6 +5020,7 @@ export function App() {
       return false;
     }
 
+    const providerName = getProviderDisplayName(draft.providers, providerId);
     const removedModelIds = new Set((draft?.models ?? []).filter((model) => model.provider === providerId).map((model) => model.id));
     const previousDraft = cloneConfig(draft);
     const previousLoadConfig = loadState ? cloneConfig(loadState.config) : null;
@@ -3759,7 +5030,7 @@ export function App() {
     nextConfig.models = nextConfig.models.filter((model) => model.provider !== providerId);
 
     const saved = await persistConfig(nextConfig, {
-      notice: `Deleted provider "${providerId}".`,
+      notice: `Deleted provider "${providerName}".`,
       preserveFilesystemDraft: true,
       previousDraft,
       previousLoadConfig
@@ -3779,6 +5050,38 @@ export function App() {
     }
 
     return true;
+  };
+
+  const duplicateProvider = async (providerId: string): Promise<void> => {
+    if (!draft) {
+      return;
+    }
+
+    const provider = draft.providers[providerId];
+    if (!provider) {
+      return;
+    }
+
+    const previousDraft = cloneConfig(draft);
+    const previousLoadConfig = loadState ? cloneConfig(loadState.config) : null;
+    const nextConfig = previousLoadConfig ? cloneConfig(previousLoadConfig) : cloneConfig(draft);
+    const nextProviderId = createUniqueProviderId(provider.kind, nextConfig.providers);
+    const nextProviderName = createCopyLabel(
+      getProviderDisplayName(draft.providers, providerId),
+      Object.values(nextConfig.providers).map((candidate) => candidate.name)
+    );
+
+    nextConfig.providers[nextProviderId] = {
+      ...provider,
+      name: nextProviderName
+    };
+
+    await persistConfig(nextConfig, {
+      notice: `Duplicated provider "${nextProviderName}".`,
+      preserveFilesystemDraft: true,
+      previousDraft,
+      previousLoadConfig
+    });
   };
 
   const confirmDeleteProvider = (providerId: string) => {
@@ -3809,6 +5112,7 @@ export function App() {
     }
 
     const provider = draft.providers[modelModal.form.provider];
+    const providerName = getProviderDisplayName(draft.providers, modelModal.form.provider);
 
     if (!provider) {
       setError("Select a provider first.");
@@ -3816,7 +5120,7 @@ export function App() {
     }
 
     if (!providerSupportsModelDiscovery(provider)) {
-      setError(`${provider.name} does not support model browsing yet.`);
+      setError(`${providerName} does not support model browsing yet.`);
       return;
     }
 
@@ -3825,7 +5129,7 @@ export function App() {
 
     setModelBrowserModal({
       providerId: modelModal.form.provider,
-      providerName: provider.name,
+      providerName,
       entries: cachedEntries ?? [],
       query: "",
       selectedModelId: modelModal.form.model.trim() || cachedEntries?.[0]?.id || null,
@@ -3859,7 +5163,7 @@ export function App() {
               error:
                 discoverError instanceof Error
                   ? discoverError.message
-                  : `Failed to load models from ${provider.name}.`
+                  : `Failed to load models from ${providerName}.`
             }
           : current
       );
@@ -3879,7 +5183,7 @@ export function App() {
     }
 
     if (!draft?.providers[modelConfig.provider]) {
-      setError(`Model provider "${modelConfig.provider}" does not exist yet.`);
+      setError(`Model provider "${getProviderDisplayName(draft.providers, modelConfig.provider)}" does not exist yet.`);
       return;
     }
 
@@ -3953,6 +5257,39 @@ export function App() {
     return true;
   };
 
+  const duplicateModel = async (index: number): Promise<void> => {
+    if (!draft) {
+      return;
+    }
+
+    const model = draft.models[index];
+    if (!model) {
+      return;
+    }
+
+    const previousDraft = cloneConfig(draft);
+    const previousLoadConfig = loadState ? cloneConfig(loadState.config) : null;
+    const nextConfig = previousLoadConfig ? cloneConfig(previousLoadConfig) : cloneConfig(draft);
+    const nextModelLabel = createCopyLabel(
+      model.label || model.model || model.id,
+      nextConfig.models.map((candidate) => candidate.label)
+    );
+    const nextModel: BenchLocalModelConfig = {
+      ...model,
+      id: createUniqueModelId(model, nextConfig.models),
+      label: nextModelLabel
+    };
+
+    nextConfig.models.push(nextModel);
+
+    await persistConfig(nextConfig, {
+      notice: `Duplicated model "${nextModelLabel}".`,
+      preserveFilesystemDraft: true,
+      previousDraft,
+      previousLoadConfig
+    });
+  };
+
   const confirmDeleteModel = (index: number) => {
     const model = draft?.models[index];
     if (!model) {
@@ -3981,6 +5318,129 @@ export function App() {
         });
       }
     });
+  };
+
+  const startWebBenchPackState = (tab: BenchLocalWorkspaceTab, inspection: BenchPackInspection) => {
+    setActiveRuns((current) => ({
+      ...current,
+      [tab.id]: { benchPackId: inspection.id, mode: "host" }
+    }));
+    setStoppingRuns((current) => {
+      if (!current[tab.id]) {
+        return current;
+      }
+
+      const next = { ...current };
+      delete next[tab.id];
+      return next;
+    });
+    setLiveRuns((current) => ({
+      ...current,
+      [tab.id]: current[tab.id] ?? {
+        events: [],
+        resultsByModel: {},
+        activeCellKeys: []
+      }
+    }));
+  };
+
+  const stopWebBenchPackState = (tabId: string) => {
+    setActiveRuns((current) => {
+      if (!current[tabId]) {
+        return current;
+      }
+
+      const next = { ...current };
+      delete next[tabId];
+      return next;
+    });
+    setStoppingRuns((current) => {
+      if (!current[tabId]) {
+        return current;
+      }
+
+      const next = { ...current };
+      delete next[tabId];
+      return next;
+    });
+    setLiveRuns((current) => {
+      if (!current[tabId]) {
+        return current;
+      }
+
+      const next = { ...current };
+      delete next[tabId];
+      return next;
+    });
+  };
+
+  const requestWebBenchPackStop = (tabId: string) => {
+    setStoppingRuns((current) => ({
+      ...current,
+      [tabId]: true
+    }));
+  };
+
+  const renderWebBenchPackPane = (tab: BenchLocalWorkspaceTab) => {
+    if (!draft || !tab.benchPackId) {
+      return null;
+    }
+
+    const inspection = benchPackInspections.find((candidate) => candidate.id === tab.benchPackId);
+
+    if (!inspection || (inspection.manifest?.type ?? "table") !== "web") {
+      return null;
+    }
+
+    const isActive = tab.id === activeTab?.id;
+    const tabRunSummary = runSummaries[tab.id] ?? null;
+    const tabLoadedHistory = loadedHistoryRuns[tab.id] ?? null;
+    const isTabRunning = Boolean(activeRuns[tab.id]);
+    const isTabStopping = Boolean(stoppingRuns[tab.id]);
+
+    return (
+      <div
+        key={tab.id}
+        className={`tabbed-workspace-pane web-benchpack-pane${isActive ? " is-active" : " is-inactive"}`}
+        aria-hidden={!isActive}
+      >
+        <WebBenchPackSection
+          tab={tab}
+          inspection={inspection}
+          selectedModels={resolveTabModels(tab, draft.models)}
+          providers={draft.providers}
+          modelAvailabilityById={modelAvailabilityById}
+          checkingModelAvailability={checkingModelAvailability}
+          runSummary={tabRunSummary}
+          loadedHistory={tabLoadedHistory}
+          isRunning={isTabRunning}
+          isStopping={isTabStopping}
+          onStartState={() => startWebBenchPackState(tab, inspection)}
+          onStopState={() => stopWebBenchPackState(tab.id)}
+          onRequestStop={() => requestWebBenchPackStop(tab.id)}
+          onEditModels={() =>
+            setTabModelsModal({
+              tabId: tab.id,
+              selections: structuredClone(tab.modelSelections)
+            })
+          }
+          onEditSampling={() =>
+            setSamplingModal({
+              tabId: tab.id,
+              benchPackId: inspection.id,
+              benchPackName: inspection.manifest?.name ?? inspection.id,
+              defaults: {
+                ...DEFAULT_BENCHLOCAL_GENERATION,
+                ...(inspection.manifest?.samplingDefaults ?? {})
+              },
+              form: createSamplingForm(tab.samplingOverrides)
+            })
+          }
+          onHistorySaved={(summary) => void handleWebPackRunSummarySaved(tab.id, summary)}
+          onClearHistory={() => clearLoadedHistoryRun(tab.id)}
+        />
+      </div>
+    );
   };
 
   return (
@@ -4014,6 +5474,9 @@ export function App() {
 
               {!settingsOpen ? (
                 <div className="toolbar-cluster">
+                  {agentAccessState?.running ? (
+                    <span className="status-chip status-ready">Agent API</span>
+                  ) : null}
                   <BenchPackPickerTrigger
                     inspections={readyInspections}
                     open={tabMenuOpen}
@@ -4094,8 +5557,6 @@ export function App() {
             <SettingsScene
               settingsTab={settingsTab}
               setSettingsTab={setSettingsTab}
-              settingsNotice={settingsNotice}
-              error={error}
               draft={draft}
               loadState={loadState}
               hasUnsavedChanges={hasUnsavedChanges}
@@ -4106,12 +5567,11 @@ export function App() {
               registryWarning={registryWarning}
               benchPackMutations={benchPackMutations}
               verifierStatuses={verifierStatuses}
+              agentAccessState={agentAccessState}
               onBack={() => {
                 setSettingsNotice(null);
                 setSettingsOpen(false);
               }}
-              onDismissNotice={() => setSettingsNotice(null)}
-              onDismissError={() => setError(null)}
               onSaveAdvanced={() => void save()}
               onResetAdvanced={reset}
               onCreateProvider={() => setProviderModal({ mode: "create", form: createEmptyProvider() })}
@@ -4122,8 +5582,10 @@ export function App() {
                   form: toProviderForm(providerId, draft.providers[providerId])
                 })
               }
+              onDuplicateProvider={(providerId) => void duplicateProvider(providerId)}
               onCreateModel={() => setModelModal({ mode: "create", form: createEmptyModel(providerIds[0] ?? "openrouter") })}
               onEditModel={(index) => setModelModal({ mode: "edit", index, form: toModelForm(draft.models[index]) })}
+              onDuplicateModel={(index) => void duplicateModel(index)}
               onStartVerifier={async (benchPackId, benchPackName, verifierId) => {
                 setError(null);
                 setStoppingVerifierStarts((current) => {
@@ -4214,6 +5676,8 @@ export function App() {
               onInstallBenchPackFromUrl={(url) => installBenchPackFromUrl(url)}
               onUpdateBenchPack={(benchPackId) => void updateBenchPack(benchPackId)}
               onUninstallBenchPack={(benchPackId) => void uninstallInstalledBenchPack(benchPackId)}
+              onConfigureAgentAccess={(input) => void configureAgentAccess(input)}
+              onRegenerateAgentToken={() => void regenerateAgentToken()}
               updateDraft={updateDraft}
               onUpdateVerifier={(benchPackId, verifierId, updater) => {
                 void saveVerifierConfig(benchPackId, verifierId, updater);
@@ -4311,39 +5775,6 @@ export function App() {
 	            </aside>
 
 	            <section className="desktop-main">
-	              {appNotice ? (
-                  <Banner tone="success">
-                    <div className="banner-row">
-                      <span>{appNotice}</span>
-                      <button
-                        type="button"
-                        className="banner-dismiss"
-                        onClick={() => setAppNotice(null)}
-                        aria-label="Dismiss notice"
-                        title="Dismiss"
-                      >
-                        <X size={14} />
-                      </button>
-                    </div>
-                  </Banner>
-                ) : null}
-                {showDownloadedUpdateBanner ? (
-                  <Banner tone="success">
-                    <div className="banner-row">
-                      <span>{describeAppUpdateState(appUpdateState)}</span>
-                      <button
-                        type="button"
-                        className="banner-dismiss"
-                        onClick={() => setDismissedDownloadedUpdateVersion(downloadedUpdateVersion)}
-                        aria-label="Dismiss update notice"
-                        title="Dismiss"
-                      >
-                        <X size={14} />
-                      </button>
-                    </div>
-                  </Banner>
-                ) : null}
-	              {error ? <Banner tone="danger">{error}</Banner> : null}
 	              {isBusy && !draft ? <Banner tone="neutral">Loading BenchLocal config...</Banner> : null}
 
 	              <div className="workspace-scroll">
@@ -4535,13 +5966,18 @@ export function App() {
                           </div>
                         </div>
 	                      <div className="tabbed-workspace-content">
+                          {workspaceTabs.map(renderWebBenchPackPane)}
 	                        {activeInspection && activeTab ? (
-	                          <BenchmarkSection
+                            (activeInspection.manifest?.type ?? "table") === "web" ? null : (
+                              <div className="tabbed-workspace-pane table-benchpack-pane is-active">
+	                            <BenchmarkSection
                             tabId={activeTab.id}
 	                            inspection={activeInspection}
                             verifierStatus={activeVerifierStatus}
                             runBlocker={activeRunBlocker}
 	                            selectedModels={activeDisplayModels}
+                            modelAvailabilityById={modelAvailabilityById}
+                            checkingModelAvailability={checkingModelAvailability}
                             providers={draft.providers}
 	                            runSummary={activeRunSummary}
                               historyEntries={runHistories[activeInspection.id] ?? []}
@@ -4646,6 +6082,7 @@ export function App() {
                                 setSettingsOpen(true);
                               }}
                               onRefreshVerification={() => void loadVerifierStatuses()}
+                              onRefreshModelAvailability={() => void refreshModelAvailability(activeDisplayModels)}
                               onClearHistory={() => clearLoadedHistoryRun(activeTab.id)}
                               onStartOver={() => resetTabRunState(activeTab)}
 	                            onRun={() =>
@@ -4663,7 +6100,10 @@ export function App() {
                               }
 	                            onOpenDetail={setDetailModal}
 	                          />
+                              </div>
+                            )
 	                        ) : (
+                            <div className="tabbed-workspace-pane is-active">
 	                          <EmptyWorkspace
                               providerCount={Object.keys(draft?.providers ?? {}).length}
                               modelCount={draft?.models.length ?? 0}
@@ -4684,6 +6124,7 @@ export function App() {
                                 activeTab ? () => setTabMenuOpen(true) : undefined
                               }
                             />
+                            </div>
 	                        )}
 	                      </div>
 	                    </div>
@@ -4807,6 +6248,8 @@ export function App() {
 
       </main>
 
+      <ToastViewport messages={toastMessages} onDismiss={dismissToast} />
+
       {providerModal ? (
         <Modal
           title={providerModal.mode === "create" ? "Add Provider" : "Edit Provider"}
@@ -4918,10 +6361,7 @@ export function App() {
                   label="Provider"
                   value={modelModal.form.provider}
                   options={providerIds.length > 0 ? providerIds : ["openrouter"]}
-                  getOptionLabel={(value) => {
-                    const provider = draft?.providers[value];
-                    return provider ? provider.name : value;
-                  }}
+                  getOptionLabel={(value) => getProviderDisplayName(draft?.providers ?? {}, value)}
                   onChange={(value) => setModelModal((current) => current ? { ...current, form: { ...current.form, provider: value } } : current)}
                 />
                 <Field label="Group" value={modelModal.form.group} placeholder="primary" onChange={(value) => setModelModal((current) => current ? { ...current, form: { ...current.form, group: value } } : current)} />
@@ -4954,7 +6394,12 @@ export function App() {
                   </div>
                 </label>
                 <Field label="Display Label" value={modelModal.form.label} placeholder="GPT-4.1 via OpenRouter" onChange={(value) => setModelModal((current) => current ? { ...current, form: { ...current.form, label: value } } : current)} />
-                <Field label="Computed ID" value={`${modelModal.form.provider}:${modelModal.form.model}`.replace(/:$/, "")} readOnly onChange={() => undefined} />
+                <Field
+                  label="Display Reference"
+                  value={`${getProviderDisplayName(draft?.providers ?? {}, modelModal.form.provider)}: ${modelModal.form.model}`.replace(/: $/, "")}
+                  readOnly
+                  onChange={() => undefined}
+                />
                 <FieldToggle
                   label="Enabled"
                   checked={modelModal.form.enabled}
@@ -4994,8 +6439,7 @@ export function App() {
                 return current;
               }
 
-              const providerName =
-                draft?.providers[current.form.provider]?.name ?? current.form.provider;
+              const providerName = getProviderDisplayName(draft?.providers ?? {}, current.form.provider);
               const currentDefaultLabel = current.form.model.trim()
                 ? defaultModelLabel(providerName, current.form.model, undefined)
                 : "";
@@ -5157,14 +6601,16 @@ export function App() {
             void restoreHistoryRun(historyModal.benchPackId, runId, mode);
             setHistoryModal(null);
           }}
-          onRemoveAll={() =>
+          onDeleteSelected={(runIds) =>
             setConfirmDialog({
-              title: `Remove all histories for ${historyModal.benchPackName}?`,
-              subtitle: "This permanently deletes all saved test runs for this Bench Pack.",
-              confirmLabel: "Remove All Histories",
+              title: `Delete ${runIds.length} selected ${
+                runIds.length === 1 ? "history" : "histories"
+              } for ${historyModal.benchPackName}?`,
+              subtitle: "This permanently deletes the selected saved test runs.",
+              confirmLabel: "Delete Selected",
               tone: "danger",
               onConfirm: () => {
-                void removeAllHistoryForBenchPack(historyModal.benchPackId, historyModal.benchPackName);
+                void deleteSelectedHistoryForBenchPack(historyModal.benchPackId, historyModal.benchPackName, runIds);
               }
             })
           }
@@ -5293,7 +6739,7 @@ export function App() {
       {detailModal ? (
         <Modal
           title={`${detailModal.benchPackId} · ${detailModal.scenarioId}`}
-          subtitle={`${detailModal.modelId} · ${detailModal.summary}`}
+          subtitle={`${detailModal.modelLabel ?? detailModal.modelId} · ${detailModal.summary}`}
           onClose={() => setDetailModal(null)}
           onSubmit={() => setDetailModal(null)}
           submitLabel="Close"
@@ -5313,7 +6759,7 @@ export function App() {
             <div className="dialog-summary-copy">
               <span className="dialog-summary-label">Status</span>
               <span className="dialog-summary-value">
-                {detailModal.errorType === "provider_error" ? "Provider or Network Error" : "Validation Result"}
+                {detailModal.errorType === "provider_error" ? "Provider HTTP Error" : "Validation Result"}
               </span>
             </div>
             <span
@@ -5388,6 +6834,14 @@ function BenchPackPickerDialog({
     filteredInspections.find((inspection) => inspection.id === selectedId) ??
     filteredInspections[0] ??
     null;
+  const openBenchPack = (inspection: BenchPackInspection) => {
+    if (inspection.status !== "ready") {
+      return;
+    }
+
+    onSelectBenchPack(inspection.id);
+    setOpen(false);
+  };
 
   useEffect(() => {
     if (!open) {
@@ -5440,6 +6894,7 @@ function BenchPackPickerDialog({
                   type="button"
                   className={`benchpack-option${selectedInspection?.id === inspection.id ? " is-selected" : ""}`}
                   onClick={() => setSelectedId(inspection.id)}
+                  onDoubleClick={() => openBenchPack(inspection)}
                 >
                   <div className="benchpack-option-main">
                     <div className="settings-row-primary">{inspection.manifest?.name ?? inspection.id}</div>
@@ -5504,10 +6959,7 @@ function BenchPackPickerDialog({
                   <button
                     type="button"
                     className="primary-button"
-                    onClick={() => {
-                      onSelectBenchPack(selectedInspection.id);
-                      setOpen(false);
-                    }}
+                    onClick={() => openBenchPack(selectedInspection)}
                     disabled={selectedInspection.status !== "ready"}
                   >
                     <Plus size={14} />
@@ -5566,12 +7018,431 @@ function BenchPackPickerTrigger({
   );
 }
 
+function WebBenchPackSection({
+  tab,
+  inspection,
+  selectedModels,
+  providers,
+  modelAvailabilityById,
+  checkingModelAvailability,
+  runSummary,
+  loadedHistory,
+  isRunning,
+  isStopping,
+  onStartState,
+  onStopState,
+  onRequestStop,
+  onEditModels,
+  onEditSampling,
+  onHistorySaved,
+  onClearHistory
+}: {
+  tab: BenchLocalWorkspaceTab;
+  inspection: BenchPackInspection;
+  selectedModels: ResolvedTabModel[];
+  providers: Record<string, BenchLocalProviderConfig>;
+  modelAvailabilityById: Record<string, ModelAvailability>;
+  checkingModelAvailability: Record<string, true>;
+  runSummary: BenchPackRunSummary | null;
+  loadedHistory: LoadedHistoryEntry | null;
+  isRunning: boolean;
+  isStopping: boolean;
+  onStartState: () => void;
+  onStopState: () => void;
+  onRequestStop: () => void;
+  onEditModels: () => void;
+  onEditSampling: () => void;
+  onHistorySaved: (summary: BenchPackRunSummary) => void;
+  onClearHistory: () => void;
+}) {
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const liveRunIdRef = useRef<string | null>(null);
+  const [bridgeTargetOrigin, setBridgeTargetOrigin] = useState<string | null>(null);
+  const manifest = inspection.manifest;
+  const entryUrl = manifest?.entry ?? "";
+  const frameKey = `${inspection.id}-${loadedHistory?.runId ?? "live"}-${entryUrl}`;
+  const entryOrigin = getOriginFromUrl(entryUrl);
+  const allowedOrigins = useMemo(
+    () => new Set([entryOrigin, ...(manifest?.web?.allowedOrigins ?? [])].filter((origin): origin is string => Boolean(origin))),
+    [entryOrigin, manifest?.web?.allowedOrigins]
+  );
+  const permissions = useMemo(() => new Set<string>(manifest?.web?.permissions ?? []), [manifest?.web?.permissions]);
+  const selectedModelIds = useMemo(() => selectedModels.map((model) => model.id), [selectedModels]);
+  const bridgeModels = useMemo(
+    () =>
+      selectedModels.map(({ displayLabel, alias: _alias, ...model }) => ({
+        ...model,
+        providerId: model.provider,
+        provider: getProviderDisplayName(providers, model.provider),
+        label: displayLabel
+      })),
+    [providers, selectedModels]
+  );
+  const selectedModelAvailability = useMemo(
+    () => selectedModels.map((model) => getModelAvailabilityView(model, modelAvailabilityById, checkingModelAvailability)),
+    [checkingModelAvailability, modelAvailabilityById, selectedModels]
+  );
+
+  const postHostEvent = useCallback((event: string, payload?: unknown): boolean => {
+    const iframeWindow = iframeRef.current?.contentWindow;
+
+    if (!iframeWindow || !bridgeTargetOrigin) {
+      return false;
+    }
+
+    try {
+      iframeWindow.postMessage(
+        {
+          source: BENCHLOCAL_WEB_HOST_MESSAGE_SOURCE,
+          bridgeVersion: BENCHLOCAL_WEB_BRIDGE_VERSION,
+          event,
+          payload
+        },
+        bridgeTargetOrigin
+      );
+      return true;
+    } catch (error) {
+      console.warn(`Skipped Web Bench Pack host event "${event}" before the frame was ready.`, error);
+      return false;
+    }
+  }, [bridgeTargetOrigin]);
+
+  useEffect(() => {
+    setBridgeTargetOrigin(null);
+    liveRunIdRef.current = null;
+  }, [frameKey]);
+
+  useEffect(() => {
+    if (!loadedHistory && runSummary?.runId) {
+      liveRunIdRef.current = runSummary.runId;
+    }
+  }, [loadedHistory, runSummary?.runId]);
+
+  useEffect(() => {
+    if (!bridgeTargetOrigin) {
+      return;
+    }
+
+    postHostEvent("models.changed", {
+      models: bridgeModels,
+      availability: selectedModelAvailability
+    });
+  }, [bridgeModels, bridgeTargetOrigin, postHostEvent, selectedModelAvailability]);
+
+  const requestStop = () => {
+    onRequestStop();
+    postHostEvent("runs.stopRequested", {
+      requestedAt: new Date().toISOString(),
+      reason: "user"
+    });
+  };
+
+  useEffect(() => {
+    const iframeWindow = iframeRef.current?.contentWindow;
+
+    if (!iframeWindow || !manifest || !entryUrl) {
+      return;
+    }
+
+    const postResponse = (targetWindow: Window, targetOrigin: string, requestId: string, result: unknown, ok = true) => {
+      targetWindow.postMessage(
+        ok
+          ? {
+              source: BENCHLOCAL_WEB_HOST_MESSAGE_SOURCE,
+              bridgeVersion: BENCHLOCAL_WEB_BRIDGE_VERSION,
+              requestId,
+              ok: true,
+              result
+            }
+          : {
+              source: BENCHLOCAL_WEB_HOST_MESSAGE_SOURCE,
+              bridgeVersion: BENCHLOCAL_WEB_BRIDGE_VERSION,
+              requestId,
+              ok: false,
+              error: {
+                message: result instanceof Error ? result.message : String(result)
+              }
+            },
+        targetOrigin
+      );
+    };
+
+    const postStreamEvent = (
+      targetWindow: Window,
+      targetOrigin: string,
+      streamId: string,
+      event: BenchLocalChatStreamEvent,
+      done?: boolean
+    ) => {
+      targetWindow.postMessage(
+        {
+          source: BENCHLOCAL_WEB_HOST_MESSAGE_SOURCE,
+          bridgeVersion: BENCHLOCAL_WEB_BRIDGE_VERSION,
+          streamId,
+          event,
+          done
+        },
+        targetOrigin
+      );
+    };
+
+    const requirePermission = (permission: string) => {
+      if (!permissions.has(permission)) {
+        throw new Error(`Web Bench Pack permission denied: ${permission}.`);
+      }
+    };
+
+    const handleMessage = (event: MessageEvent<unknown>) => {
+      if (event.source !== iframeWindow || !isWebPackBridgeRequest(event.data)) {
+        return;
+      }
+
+      if (!allowedOrigins.has(event.origin)) {
+        return;
+      }
+
+      const request = event.data;
+      const targetWindow = event.source as Window;
+      const targetOrigin = event.origin;
+      setBridgeTargetOrigin((current) => (current === targetOrigin ? current : targetOrigin));
+
+      void (async () => {
+        switch (request.method) {
+          case "capabilities":
+            postResponse(targetWindow, targetOrigin, request.requestId, {
+              bridgeVersion: BENCHLOCAL_WEB_BRIDGE_VERSION,
+              permissions: Array.from(permissions),
+              pack: {
+                id: manifest.id,
+                name: manifest.name,
+                version: manifest.version,
+                entry: manifest.entry,
+                buildId: manifest.web?.buildId
+              },
+              history: {
+                runId: runSummary?.runId,
+                mode: loadedHistory ? "history" : "live",
+                playback: manifest.web?.historyPlayback === true
+              }
+            });
+            break;
+          case "models.list":
+            requirePermission("models:list");
+            postResponse(targetWindow, targetOrigin, request.requestId, {
+              models: bridgeModels,
+              availability: selectedModelAvailability
+            });
+            break;
+          case "models.getSelected":
+            requirePermission("models:read");
+            postResponse(targetWindow, targetOrigin, request.requestId, {
+              models: bridgeModels,
+              availability: selectedModelAvailability
+            });
+            break;
+          case "inference.chat":
+            requirePermission("inference:chat");
+            postResponse(
+              targetWindow,
+              targetOrigin,
+              request.requestId,
+              await window.benchlocal.webPacks.chat(request.payload as BenchLocalChatRequest)
+            );
+            break;
+          case "inference.streamChat": {
+            requirePermission("inference:stream");
+            if (!request.streamId) {
+              throw new Error("Streaming inference requires a stream id.");
+            }
+
+            let unsubscribe: () => void = () => undefined;
+            unsubscribe = window.benchlocal.webPacks.streamChat(
+              {
+                streamId: request.streamId,
+                request: request.payload as BenchLocalChatRequest
+              },
+              (payload) => {
+                postStreamEvent(targetWindow, targetOrigin, payload.streamId, payload.event, payload.done);
+
+                if (payload.done) {
+                  unsubscribe();
+                }
+              }
+            );
+            postResponse(targetWindow, targetOrigin, request.requestId, { accepted: true });
+            break;
+          }
+          case "runs.startState":
+            requirePermission("runs:write");
+            onStartState();
+            postResponse(targetWindow, targetOrigin, request.requestId, { accepted: true });
+            break;
+          case "runs.stopState":
+            requirePermission("runs:write");
+            onStopState();
+            postResponse(targetWindow, targetOrigin, request.requestId, { accepted: true });
+            break;
+          case "runs.updateProgress": {
+            requirePermission("runs:write");
+            const payload = isRecord(request.payload) ? request.payload : {};
+            const status = typeof payload.status === "string" ? payload.status as WebBenchPackHistoryPayload["status"] : "running";
+            const summary = await window.benchlocal.webPacks.saveHistory({
+              benchPackId: inspection.id,
+              runId: loadedHistory ? runSummary?.runId ?? tab.loadedRunId : liveRunIdRef.current,
+              modelIds: selectedModelIds,
+              payload: {
+                status,
+                metadata: isRecord(payload.metadata) ? payload.metadata : undefined,
+                events: [{
+                  type: "progress",
+                  createdAt: new Date().toISOString(),
+                  payload
+                }]
+              }
+            });
+            liveRunIdRef.current = summary.runId;
+            onHistorySaved(summary);
+            postResponse(targetWindow, targetOrigin, request.requestId, { accepted: true, runId: summary.runId });
+            break;
+          }
+          case "history.load":
+            requirePermission("history:read");
+            postResponse(targetWindow, targetOrigin, request.requestId, {
+              runId: runSummary?.runId,
+              payload: runSummary?.webHistory
+            });
+            break;
+          case "history.save": {
+            requirePermission("history:write");
+            const summary = await window.benchlocal.webPacks.saveHistory({
+              benchPackId: inspection.id,
+              runId: loadedHistory ? runSummary?.runId ?? tab.loadedRunId : liveRunIdRef.current,
+              modelIds: selectedModelIds,
+              payload: request.payload as WebBenchPackHistoryPayload
+            });
+            liveRunIdRef.current = summary.runId;
+            onHistorySaved(summary);
+            postResponse(targetWindow, targetOrigin, request.requestId, { accepted: true, runId: summary.runId, summary });
+            break;
+          }
+          case "history.writeArtifact": {
+            requirePermission("artifacts:write");
+            const artifactPayload = request.payload as {
+              kind: string;
+              label: string;
+              path?: string;
+              contentType?: string;
+              content: unknown;
+            };
+            const result = await window.benchlocal.webPacks.writeArtifact({
+              benchPackId: inspection.id,
+              runId: loadedHistory ? runSummary?.runId ?? tab.loadedRunId : liveRunIdRef.current,
+              modelIds: selectedModelIds,
+              artifact: artifactPayload
+            });
+            liveRunIdRef.current = result.summary.runId;
+            onHistorySaved(result.summary);
+            postResponse(targetWindow, targetOrigin, request.requestId, result.artifact satisfies ArtifactRef);
+            break;
+          }
+          default:
+            throw new Error(`Unsupported Web Bench Pack bridge method: ${request.method}.`);
+        }
+      })().catch((error) => {
+        postResponse(targetWindow, targetOrigin, request.requestId, error, false);
+      });
+    };
+
+    window.addEventListener("message", handleMessage);
+    return () => window.removeEventListener("message", handleMessage);
+  }, [
+    allowedOrigins,
+    bridgeModels,
+    entryUrl,
+    inspection.id,
+    loadedHistory,
+    manifest,
+    onHistorySaved,
+    onStartState,
+    onStopState,
+    permissions,
+    runSummary,
+    selectedModelAvailability,
+    selectedModelIds,
+    tab.loadedRunId
+  ]);
+
+  if (!manifest || !entryUrl) {
+    return (
+      <section className="web-benchpack-shell">
+        <div className="empty-workspace benchmark-empty-state">
+          <div className="empty-workspace-card benchmark-empty-card">
+            <div className="benchmark-empty-icon"><CircleAlert size={18} /></div>
+            <p className="eyebrow">Web Bench Pack</p>
+            <h3 className="panel-title">This Web Bench Pack is missing its hosted entry.</h3>
+            <p className="section-copy">Update or reinstall the Bench Pack from the registry.</p>
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="web-benchpack-shell">
+      <div className="web-benchpack-toolbar">
+        <div>
+          <p className="eyebrow">Interactive Bench Pack</p>
+          <h2>{manifest.name}</h2>
+        </div>
+        <div className="section-actions">
+          {isRunning ? (
+            <button type="button" className="button-warn" onClick={requestStop} disabled={isStopping}>
+              <Square size={14} />
+              {isStopping ? "Stopping..." : "Stop"}
+            </button>
+          ) : null}
+          {loadedHistory ? (
+            <button type="button" className="ghost-button" onClick={onClearHistory}>
+              <RotateCcw size={14} />
+              Back to Live
+            </button>
+          ) : null}
+          <button type="button" className="ghost-button" onClick={onEditSampling}>
+            <SlidersHorizontal size={14} />
+            Samplings
+          </button>
+          <button type="button" className="ghost-button" onClick={onEditModels}>
+            <Bot size={14} />
+            Edit Models
+          </button>
+        </div>
+      </div>
+      <div className="web-benchpack-status-row">
+        <span className="status-chip status-idle">{manifest.version}</span>
+        <span className="status-chip status-idle">{selectedModels.length} selected model{selectedModels.length === 1 ? "" : "s"}</span>
+        {runSummary?.runId ? <span className="status-chip status-idle">{runSummary.runId}</span> : null}
+      </div>
+      <iframe
+        key={frameKey}
+        ref={iframeRef}
+        title={manifest.name}
+        src={entryUrl}
+        className="web-benchpack-frame"
+        sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads"
+        referrerPolicy="no-referrer"
+      />
+    </section>
+  );
+}
+
 function BenchmarkSection({
   tabId,
   inspection,
   verifierStatus,
   runBlocker,
   selectedModels,
+  modelAvailabilityById,
+  checkingModelAvailability,
   providers,
   runSummary,
   historyEntries,
@@ -5592,6 +7463,7 @@ function BenchmarkSection({
   isStopping,
   onOpenVerification,
   onRefreshVerification,
+  onRefreshModelAvailability,
   onClearHistory,
   onStartOver,
   onRun,
@@ -5604,6 +7476,8 @@ function BenchmarkSection({
   verifierStatus: BenchPackVerifierStatus | null;
   runBlocker: BenchPackRunBlocker | null;
   selectedModels: ResolvedTabModel[];
+  modelAvailabilityById: Record<string, ModelAvailability>;
+  checkingModelAvailability: Record<string, true>;
   providers: Record<string, BenchLocalProviderConfig>;
   runSummary: BenchPackRunSummary | null;
   historyEntries: BenchPackRunHistoryEntry[];
@@ -5624,6 +7498,7 @@ function BenchmarkSection({
   isStopping: boolean;
   onOpenVerification: () => void;
   onRefreshVerification: () => void;
+  onRefreshModelAvailability: () => void;
   onClearHistory: () => void;
   onStartOver: () => void;
   onRun: () => void;
@@ -5633,6 +7508,7 @@ function BenchmarkSection({
 }) {
   const [runModeOpen, setRunModeOpen] = useState(false);
   const [runsPerTestOpen, setRunsPerTestOpen] = useState(false);
+  const [shareCardData, setShareCardData] = useState<ResultShareCardData | null>(null);
   const runModeRef = useRef<HTMLDivElement | null>(null);
   const runsPerTestRef = useRef<HTMLDivElement | null>(null);
   const tableScrollViewportRef = useRef<HTMLDivElement | null>(null);
@@ -5700,7 +7576,14 @@ function BenchmarkSection({
     .filter(({ result }) => result.status === "fail" && !isProviderErrorResult(result))
     .map(({ modelId, scenarioId }) => ({ modelId, scenarioId }));
   const canRetryResultCells =
-    Boolean(runSummary?.runId) && !isViewingHistory && !hasLiveActivity && !isStopping && inspection.status === "ready";
+    Boolean(runSummary?.runId) && !isReplayMode && !hasLiveActivity && !isStopping && inspection.status === "ready";
+  const selectedModelAvailability = selectedModels.map((model) =>
+    getModelAvailabilityView(model, modelAvailabilityById, checkingModelAvailability)
+  );
+  const checkingAvailability = selectedModelAvailability.some((availability) => availability.status === "checking");
+  const runSummaryComplete = isRunSummaryComplete(runSummary);
+  const runStateClass = isRunning ? "status-live" : runSummary ? runSummaryComplete ? "status-done" : "status-preview" : "status-idle";
+  const runStateLabel = hasLiveActivity ? "Live" : runSummary && !runSummaryComplete ? "Incomplete" : runSummary ? "Done" : "Idle";
 
   useEffect(() => {
     if (!runModeOpen && !runsPerTestOpen) {
@@ -5855,6 +7738,7 @@ function BenchmarkSection({
       ? undefined
       : runSummary?.resultsByModel[modelId]?.find((candidate) => candidate.scenarioId === scenarioId);
     const result = liveResult ?? persistedResult;
+    const model = selectedModels.find((candidate) => candidate.id === modelId);
     const isActive = liveRun?.activeCellKeys.includes(`${modelId}::${scenarioId}`) ?? false;
 
     if (isActive) {
@@ -5889,6 +7773,7 @@ function BenchmarkSection({
             runId: liveRun?.runId ?? runSummary?.runId ?? null,
             benchPackId: inspection.id,
             modelId,
+            modelLabel: model?.displayLabel ?? model?.label,
             scenarioId,
             summary: result.summary,
             rawLog: result.rawLog,
@@ -5935,8 +7820,8 @@ function BenchmarkSection({
             <div className="workspace-stat-chips">
               <span className="status-chip status-preview">{inspection.scenarioCount ?? 0} scenarios</span>
               <span className="status-chip status-idle">{selectedModels.length} models</span>
-              <span className={`status-chip ${isRunning ? "status-live" : runSummary ? "status-done" : "status-idle"}`}>
-                {hasLiveActivity ? "Live" : runSummary ? "Done" : "Idle"}
+              <span className={`status-chip ${runStateClass}`}>
+                {runStateLabel}
               </span>
             </div>
           </div>
@@ -6150,6 +8035,12 @@ function BenchmarkSection({
               <>
                 <div ref={tableScrollViewportRef} className="table-scroll">
                   <table className="result-table">
+                  <colgroup>
+                    <col className="model-column" />
+                    {scenarios.map((scenario) => (
+                      <col key={scenario.id} />
+                    ))}
+                  </colgroup>
                   <thead>
                     <tr>
                       <th className={`scenario-row-label${stickyColumnShadow ? " has-scroll-shadow" : ""}`}>
@@ -6175,41 +8066,59 @@ function BenchmarkSection({
                     </tr>
                   </thead>
                   <tbody>
-                    {selectedModels.map((model) => (
-                      <tr key={model.id}>
-                        <td className={`scenario-row-label${stickyColumnShadow ? " has-scroll-shadow" : ""}`}>
-                          {isViewingHistory ? (
-                            <div
-                              className={`model-badge${isReplayMode ? "" : " model-badge-history"}`}
-                              title={
-                                isReplayMode
-                                  ? "Replay mode uses the models from the saved run."
-                                  : "This history view uses the models from the saved run."
-                              }
-                            >
-                              {model.displayLabel}
+                    {selectedModels.map((model) => {
+                      const availability = getModelAvailabilityView(model, modelAvailabilityById, checkingModelAvailability);
+
+                      return (
+                        <tr key={model.id}>
+                          <td className={`scenario-row-label${stickyColumnShadow ? " has-scroll-shadow" : ""}`}>
+                            <div className="model-cell">
+                              {isViewingHistory ? (
+                                <div className="model-badge-wrap">
+                                  <span
+                                    className={`model-availability-dot ${modelAvailabilityChipClass(availability)}`}
+                                    title={modelAvailabilityTitle(availability)}
+                                  />
+                                  <div
+                                    className={`model-badge${isReplayMode ? "" : " model-badge-history"}`}
+                                    title={
+                                      isReplayMode
+                                        ? "Replay mode uses the models from the saved run."
+                                        : "This history view uses the models from the saved run."
+                                    }
+                                  >
+                                    {model.displayLabel}
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="model-badge-wrap">
+                                  <span
+                                    className={`model-availability-dot ${modelAvailabilityChipClass(availability)}`}
+                                    title={modelAvailabilityTitle(availability)}
+                                  />
+                                  <button
+                                    type="button"
+                                    className="model-badge model-badge-button"
+                                    onClick={() => onEditModelAlias(model)}
+                                    title="Edit model alias"
+                                  >
+                                    {model.displayLabel}
+                                  </button>
+                                </div>
+                              )}
                             </div>
-                          ) : (
-                            <button
-                              type="button"
-                              className="model-badge-button"
-                              onClick={() => onEditModelAlias(model)}
-                              title="Edit model alias"
-                            >
-                              <div className="model-badge">{model.displayLabel}</div>
-                            </button>
-                          )}
-                        </td>
-                        {scenarios.map((scenario) => (
-                          <td
-                            key={`${model.id}-${scenario.id}`}
-                            className={`result-icon-cell ${scenario.id === highlightedScenarioId ? "active-column" : ""}`}
-                          >
-                            {renderResultCell(model.id, scenario.id)}
                           </td>
-                        ))}
-                      </tr>
-                    ))}
+                          {scenarios.map((scenario) => (
+                            <td
+                              key={`${model.id}-${scenario.id}`}
+                              className={`result-icon-cell ${scenario.id === highlightedScenarioId ? "active-column" : ""}`}
+                            >
+                              {renderResultCell(model.id, scenario.id)}
+                            </td>
+                          ))}
+                        </tr>
+                      );
+                    })}
                   </tbody>
                   </table>
                 </div>
@@ -6266,28 +8175,43 @@ function BenchmarkSection({
                     />
                   </div>
                 ) : null}
-                {runSummary ? (
-                  <div className="table-retry-actions">
+                <div className="table-retry-actions">
+                  <div className="table-retry-actions-left">
                     <button
                       type="button"
                       className="ghost-button ghost-button-compact"
-                      disabled={!canRetryResultCells || providerErrorRetryCells.length === 0}
-                      onClick={() => onRetryCells(providerErrorRetryCells, "provider errors")}
-                    >
-                      <CircleAlert size={14} />
-                      Retry Provider Errors
-                    </button>
-                    <button
-                      type="button"
-                      className="ghost-button ghost-button-compact"
-                      disabled={!canRetryResultCells || failedRetryCells.length === 0}
-                      onClick={() => onRetryCells(failedRetryCells, "failed results")}
+                      disabled={hasLiveActivity || selectedModels.length === 0}
+                      onClick={onRefreshModelAvailability}
                     >
                       <RotateCcw size={14} />
-                      Retry Failed Results
+                      {checkingAvailability ? "Checking..." : "Refresh Status"}
                     </button>
                   </div>
-                ) : null}
+                  <div className="table-retry-actions-right">
+                    {runSummary ? (
+                      <>
+                        <button
+                          type="button"
+                          className="ghost-button ghost-button-compact"
+                          disabled={!canRetryResultCells || providerErrorRetryCells.length === 0}
+                          onClick={() => onRetryCells(providerErrorRetryCells, "provider errors")}
+                        >
+                          <CircleAlert size={14} />
+                          Retry Provider Errors
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost-button ghost-button-compact"
+                          disabled={!canRetryResultCells || failedRetryCells.length === 0}
+                          onClick={() => onRetryCells(failedRetryCells, "failed results")}
+                        >
+                          <RotateCcw size={14} />
+                          Retry Failed Results
+                        </button>
+                      </>
+                    ) : null}
+                  </div>
+                </div>
               </>
             )}
           </section>
@@ -6296,7 +8220,18 @@ function BenchmarkSection({
             <section className="scoreboard">
               {Object.entries(runSummary.scores).map(([modelId, score]) => {
                 const model = selectedModels.find((candidate) => candidate.id === modelId);
-                const providerName = model ? providers[model.provider]?.name?.trim() || model.provider : "";
+                const hasScoreData = (runSummary.resultsByModel[modelId]?.length ?? 0) > 0;
+                const shareRunModeLabel =
+                  EXECUTION_MODE_OPTIONS.find((option) => option.value === (runSummary.executionMode ?? executionMode))?.label ??
+                  currentExecutionModeLabel;
+                const shareData = buildResultShareCardData({
+                  runSummary,
+                  model,
+                  providers,
+                  score,
+                  runModeLabel: shareRunModeLabel
+                });
+                const providerName = model ? getProviderDisplayName(providers, model.provider) : "";
                 const modelName = model?.model?.trim();
                 const modelSubtitle =
                   providerName && modelName
@@ -6305,16 +8240,30 @@ function BenchmarkSection({
 
                 return (
                   <div key={modelId} className="score-card score-card-compact">
-                    <div>
-                      <h3 style={{ margin: 0, fontSize: "1rem" }}>{model?.displayLabel ?? modelId}</h3>
-                      <p className="muted-copy" style={{ marginTop: "6px", fontSize: "0.76rem" }}>{modelSubtitle}</p>
+                    <div className="score-card-head">
+                      <div>
+                        <h3 style={{ margin: 0, fontSize: "1rem" }}>{model?.displayLabel ?? modelId}</h3>
+                        <p className="muted-copy" style={{ marginTop: "6px", fontSize: "0.76rem" }}>{modelSubtitle}</p>
+                      </div>
+                      <button
+                        type="button"
+                        className="ghost-button ghost-button-compact score-share-button"
+                        disabled={!hasScoreData}
+                        title={hasScoreData ? "Preview share card" : "No results to share yet"}
+                        onClick={() => setShareCardData(shareData)}
+                      >
+                        <Share2 size={14} />
+                        Share
+                      </button>
                     </div>
                     <div className="score-card-foot">
-                      <span className="score-value">{score.totalScore}</span>
+                      <span className={`score-value${hasScoreData ? "" : " score-value-empty"}`}>
+                        {hasScoreData ? score.totalScore : "—"}
+                      </span>
                       <div className="category-chip-row">
                         {score.categories.map((category) => (
                           <span key={category.id} className="status-chip category-chip">
-                            {category.id}: {category.score}
+                            {category.id}: {hasScoreData ? category.score : "—"}
                           </span>
                         ))}
                       </div>
@@ -6326,7 +8275,116 @@ function BenchmarkSection({
           ) : null}
         </div>
       </div>
+      {shareCardData ? <ResultShareCardModal data={shareCardData} onClose={() => setShareCardData(null)} /> : null}
     </section>
+  );
+}
+
+function ResultShareCardModal({
+  data,
+  onClose
+}: {
+  data: ResultShareCardData;
+  onClose: () => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    let cancelled = false;
+
+    if (!canvas) {
+      return;
+    }
+
+    void Promise.all([loadShareCardFonts(), loadShareCardLogoImage()]).then(([, logoImage]) => {
+      if (!cancelled && canvasRef.current) {
+        drawShareCardCanvas(canvasRef.current, data, logoImage);
+      }
+    }).catch((error) => {
+      console.error(error);
+
+      if (!cancelled && canvasRef.current) {
+        drawShareCardCanvas(canvasRef.current, data);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [data]);
+
+  const savePng = async () => {
+    const blob = await createShareCardBlob(data);
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = data.fileName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const copyImage = async () => {
+    type ClipboardItemConstructor = new (items: Record<string, Blob>) => ClipboardItem;
+    const clipboardItem = (window as typeof window & { ClipboardItem?: ClipboardItemConstructor }).ClipboardItem;
+
+    if (!navigator.clipboard?.write || !clipboardItem) {
+      return;
+    }
+
+    const blob = await createShareCardBlob(data);
+    await navigator.clipboard.write([new clipboardItem({ "image/png": blob })]);
+  };
+
+  return (
+    <Modal
+      title="Share Result Card"
+      subtitle="Preview a social-ready PNG for this model result."
+      onClose={onClose}
+      onSubmit={() => void savePng().catch((error) => console.error(error))}
+      submitLabel="Save PNG"
+      size="wide"
+      leadingActions={
+        <button
+          type="button"
+          className="ghost-button"
+          onClick={() => void copyImage().catch((error) => console.error(error))}
+        >
+          <Copy size={14} />
+          Copy Image
+        </button>
+      }
+    >
+      <div className="share-card-modal-body">
+        <div className="share-card-preview-shell">
+          <canvas
+            ref={canvasRef}
+            width={SHARE_CARD_PIXEL_WIDTH}
+            height={SHARE_CARD_PIXEL_HEIGHT}
+            className="share-card-canvas"
+            aria-label={`Share card preview for ${data.modelLabel}`}
+          />
+        </div>
+        <div className="share-card-meta-grid">
+          <div>
+            <span className="share-card-meta-label">Size</span>
+            <span className="share-card-meta-value">
+              {SHARE_CARD_PIXEL_WIDTH}x{SHARE_CARD_PIXEL_HEIGHT} PNG
+            </span>
+          </div>
+          <div>
+            <span className="share-card-meta-label">Result</span>
+            <span className="share-card-meta-value">{data.scoreValue} score / {data.completedCount} results</span>
+          </div>
+          <div>
+            <span className="share-card-meta-label">Filename</span>
+            <span className="share-card-meta-value">{data.fileName}</span>
+          </div>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
@@ -6357,10 +8415,10 @@ function TabModelsModal({
   const providerOptions = [
     { value: "all", label: "All Providers" },
     ...Array.from(new Set(enabledModels.map((model) => model.provider)))
-      .sort((left, right) => (providers[left]?.name ?? left).localeCompare(providers[right]?.name ?? right))
+      .sort((left, right) => getProviderDisplayName(providers, left).localeCompare(getProviderDisplayName(providers, right)))
       .map((providerId) => ({
         value: providerId,
-        label: providers[providerId]?.name ?? providerId
+        label: getProviderDisplayName(providers, providerId)
       }))
   ];
   const groupOptions = [
@@ -6378,8 +8436,9 @@ function TabModelsModal({
     const haystack = [
       model.label,
       model.id,
+      model.model,
       model.group,
-      providers[model.provider]?.name ?? model.provider
+      getProviderDisplayName(providers, model.provider)
     ]
       .filter(Boolean)
       .join(" ")
@@ -6484,28 +8543,29 @@ function TabModelsModal({
               </div>
             ) : filteredAvailableModels.map((model) => {
               const isSelected = selectedIdSet.has(model.id);
+              const providerName = getProviderDisplayName(providers, model.provider);
 
               return (
-              <div key={model.id} className="tab-model-row">
-                <label className="tab-model-toggle">
-                  <input
-                    type="checkbox"
-                    checked={isSelected}
-                    onChange={(event) => toggleModel(model.id, event.target.checked)}
-                    className="h-4 w-4 accent-[var(--accent)]"
-                  />
-                  <span className="tab-model-toggle-copy">
-                    <span className="settings-row-primary">{model.label}</span>
-                    <span className="settings-row-secondary settings-mono-cell">{providers[model.provider]?.name ?? model.provider}</span>
-                    <span className="settings-row-secondary settings-mono-cell">{model.id}</span>
-                  </span>
-                </label>
+                <div key={model.id} className="tab-model-row">
+                  <label className="tab-model-toggle">
+                    <input
+                      type="checkbox"
+                      checked={isSelected}
+                      onChange={(event) => toggleModel(model.id, event.target.checked)}
+                      className="h-4 w-4 accent-[var(--accent)]"
+                    />
+                    <span className="tab-model-toggle-copy">
+                      <span className="settings-row-primary">{model.label}</span>
+                      <span className="settings-row-secondary">{providerName}</span>
+                      <span className="settings-row-secondary settings-mono-cell">{getModelDisplayIdentifier(model)}</span>
+                    </span>
+                  </label>
 
-                <div className="tab-model-row-meta">
-                  <span className="status-chip status-idle">{model.group.trim() || "Ungrouped"}</span>
+                  <div className="tab-model-row-meta">
+                    <span className="status-chip status-idle">{model.group.trim() || "Ungrouped"}</span>
+                  </div>
                 </div>
-              </div>
-            );
+              );
             })}
           </div>
         </section>
@@ -6522,6 +8582,7 @@ function TabModelsModal({
               </div>
             ) : selectedModels.map((model) => {
               const selection = selectionMap.get(model.id);
+              const providerName = getProviderDisplayName(providers, model.provider);
 
               return (
                 <div
@@ -6550,7 +8611,8 @@ function TabModelsModal({
                     />
                     <span className="tab-model-toggle-copy">
                       <span className="settings-row-primary">{model.label}</span>
-                      <span className="settings-row-secondary settings-mono-cell">{model.id}</span>
+                      <span className="settings-row-secondary">{providerName}</span>
+                      <span className="settings-row-secondary settings-mono-cell">{getModelDisplayIdentifier(model)}</span>
                     </span>
                   </label>
 
@@ -6699,7 +8761,7 @@ function SamplingModal({
             Effective defaults:
             {" "}
             {SAMPLING_FIELDS.map((field) => {
-              const value = defaults[field.key as keyof GenerationRequest];
+              const value = defaults[field.key];
               return value === undefined ? null : (
                 <span key={field.key} className="settings-inline-meta">
                   <strong>{field.label}:</strong> {value}
@@ -6725,7 +8787,7 @@ function SamplingModal({
             key={field.key}
             label={field.label}
             value={form[field.key]}
-            placeholder={defaults[field.key as keyof GenerationRequest] === undefined ? field.placeholder : `Default: ${defaults[field.key as keyof GenerationRequest]}`}
+            placeholder={defaults[field.key] === undefined ? field.placeholder : `Default: ${defaults[field.key]}`}
             onChange={(value) => onChange({
               ...form,
               [field.key]: value
@@ -6966,8 +9028,6 @@ function DetachedLogsWindow() {
 function SettingsScene({
   settingsTab,
   setSettingsTab,
-  settingsNotice,
-  error,
   draft,
   loadState,
   hasUnsavedChanges,
@@ -6978,15 +9038,16 @@ function SettingsScene({
   registryWarning,
   benchPackMutations,
   verifierStatuses,
+  agentAccessState,
   onBack,
-  onDismissNotice,
-  onDismissError,
   onSaveAdvanced,
   onResetAdvanced,
   onCreateProvider,
   onEditProvider,
+  onDuplicateProvider,
   onCreateModel,
   onEditModel,
+  onDuplicateModel,
   onStartVerifier,
   onStopVerifier,
   onDeleteVerifierImage,
@@ -6995,13 +9056,13 @@ function SettingsScene({
   onInstallBenchPackFromUrl,
   onUpdateBenchPack,
   onUninstallBenchPack,
+  onConfigureAgentAccess,
+  onRegenerateAgentToken,
   updateDraft,
   onUpdateVerifier
 }: {
   settingsTab: SettingsTab;
   setSettingsTab: (tab: SettingsTab) => void;
-  settingsNotice: string | null;
-  error: string | null;
   draft: BenchLocalConfig;
   loadState: LoadState | null;
   hasUnsavedChanges: boolean;
@@ -7012,15 +9073,16 @@ function SettingsScene({
   registryWarning: string | null;
   benchPackMutations: Record<string, BenchPackMutationState>;
   verifierStatuses: Record<string, BenchPackVerifierStatus>;
+  agentAccessState: BenchLocalAgentAccessState | null;
   onBack: () => void;
-  onDismissNotice: () => void;
-  onDismissError: () => void;
   onSaveAdvanced: () => void;
   onResetAdvanced: () => void;
   onCreateProvider: () => void;
   onEditProvider: (providerId: string) => void;
+  onDuplicateProvider: (providerId: string) => void;
   onCreateModel: () => void;
   onEditModel: (index: number) => void;
+  onDuplicateModel: (index: number) => void;
   onStartVerifier: (benchPackId: string, benchPackName: string, verifierId: string) => Promise<void>;
   onStopVerifier: (benchPackId: string) => Promise<void>;
   onDeleteVerifierImage: (benchPackId: string, benchPackName: string, verifierId: string) => void;
@@ -7029,6 +9091,8 @@ function SettingsScene({
   onInstallBenchPackFromUrl: (url: string) => Promise<boolean | void>;
   onUpdateBenchPack: (benchPackId: string) => void;
   onUninstallBenchPack: (benchPackId: string) => void;
+  onConfigureAgentAccess: (input: { enabled: boolean; access?: BenchLocalAgentAccess; port?: number }) => void;
+  onRegenerateAgentToken: () => void;
   updateDraft: (updater: (current: BenchLocalConfig) => BenchLocalConfig) => void;
   onUpdateVerifier: (
     benchPackId: string,
@@ -7065,38 +9129,6 @@ function SettingsScene({
       </aside>
 
       <div className="settings-scene-content">
-        {settingsNotice ? (
-          <Banner tone="success">
-            <div className="banner-row">
-              <span>{settingsNotice}</span>
-              <button
-                type="button"
-                className="banner-dismiss"
-                onClick={onDismissNotice}
-                aria-label="Dismiss notice"
-                title="Dismiss"
-              >
-                <X size={14} />
-              </button>
-            </div>
-          </Banner>
-        ) : null}
-        {error ? (
-          <Banner tone="danger">
-            <div className="banner-row">
-              <span>{error}</span>
-              <button
-                type="button"
-                className="banner-dismiss"
-                onClick={onDismissError}
-                aria-label="Dismiss error"
-                title="Dismiss"
-              >
-                <X size={14} />
-              </button>
-            </div>
-          </Banner>
-        ) : null}
         <div className="settings-body settings-body-scene">
             {settingsTab === "providers" ? (
               <ProvidersView
@@ -7104,6 +9136,7 @@ function SettingsScene({
                 models={draft.models}
                 onCreate={onCreateProvider}
                 onEdit={onEditProvider}
+                onDuplicate={onDuplicateProvider}
               />
             ) : null}
 
@@ -7114,6 +9147,7 @@ function SettingsScene({
                 providerIds={providerIds}
                 onCreate={onCreateModel}
                 onEdit={onEditModel}
+                onDuplicate={onDuplicateModel}
               />
             ) : null}
 
@@ -7146,6 +9180,14 @@ function SettingsScene({
                 onDeleteImage={(benchPackId, benchPackName, verifierId) => {
                   onDeleteVerifierImage(benchPackId, benchPackName, verifierId);
                 }}
+              />
+            ) : null}
+
+            {settingsTab === "agent" ? (
+              <AgentAccessView
+                state={agentAccessState}
+                onConfigure={onConfigureAgentAccess}
+                onRegenerateToken={onRegenerateAgentToken}
               />
             ) : null}
 
@@ -7205,12 +9247,14 @@ function ProvidersView({
   providers,
   models,
   onCreate,
-  onEdit
+  onEdit,
+  onDuplicate
 }: {
   providers: Record<string, BenchLocalProviderConfig>;
   models: BenchLocalModelConfig[];
   onCreate: () => void;
   onEdit: (providerId: string) => void;
+  onDuplicate: (providerId: string) => void;
 }) {
   const providerIds = Object.keys(providers);
 
@@ -7259,6 +9303,7 @@ function ProvidersView({
                   <td>
                     <div className="settings-table-actions">
                       <button type="button" onClick={() => onEdit(providerId)} className="ghost-button ghost-button-compact"><Pencil size={14} />Edit</button>
+                      <button type="button" onClick={() => onDuplicate(providerId)} className="ghost-button ghost-button-compact"><Copy size={14} />Duplicate</button>
                     </div>
                   </td>
                 </tr>
@@ -7276,13 +9321,15 @@ function ModelsView({
   providers,
   providerIds,
   onCreate,
-  onEdit
+  onEdit,
+  onDuplicate
 }: {
   models: BenchLocalModelConfig[];
   providers: Record<string, BenchLocalProviderConfig>;
   providerIds: string[];
   onCreate: () => void;
   onEdit: (index: number) => void;
+  onDuplicate: (index: number) => void;
 }) {
   const [providerFilter, setProviderFilter] = useState("all");
   const [groupFilter, setGroupFilter] = useState("all");
@@ -7290,10 +9337,10 @@ function ModelsView({
   const providerOptions = [
     { value: "all", label: "All Providers" },
     ...Array.from(new Set(models.map((model) => model.provider)))
-      .sort((left, right) => (providers[left]?.name ?? left).localeCompare(providers[right]?.name ?? right))
+      .sort((left, right) => getProviderDisplayName(providers, left).localeCompare(getProviderDisplayName(providers, right)))
       .map((providerId) => ({
         value: providerId,
-        label: providers[providerId]?.name ?? providerId
+        label: getProviderDisplayName(providers, providerId)
       }))
   ];
   const groupOptions = [
@@ -7310,7 +9357,7 @@ function ModelsView({
     .filter(({ model }) => {
       const normalizedGroup = model.group.trim() || "__ungrouped__";
       const normalizedQuery = searchQuery.trim().toLowerCase();
-      const providerName = providers[model.provider]?.name ?? model.provider;
+      const providerName = getProviderDisplayName(providers, model.provider);
       const haystack = [model.label, model.id, model.model, model.group, providerName, model.provider]
         .filter(Boolean)
         .join(" ")
@@ -7397,19 +9444,20 @@ function ModelsView({
                 <tr key={`${model.id}-${index}`}>
                   <td>
                     <div className="settings-row-primary">{model.label}</div>
-                    <div className="settings-row-secondary settings-mono-cell">{model.id}</div>
+                    <div className="settings-row-secondary settings-mono-cell">{getModelDisplayIdentifier(model)}</div>
                   </td>
                   <td>
                     <span className={`status-chip ${model.enabled ? "status-ready" : "status-inactive"}`}>
                       {model.enabled ? "active" : "inactive"}
                     </span>
                   </td>
-                  <td>{providers[model.provider]?.name ?? model.provider.split("-")[0] ?? model.provider}</td>
+                  <td>{getProviderDisplayName(providers, model.provider)}</td>
                   <td className="settings-mono-cell">{model.model}</td>
                   <td>{model.group}</td>
                   <td>
                     <div className="settings-table-actions">
                       <button type="button" onClick={() => onEdit(index)} className="ghost-button ghost-button-compact"><Pencil size={14} />Edit</button>
+                      <button type="button" onClick={() => onDuplicate(index)} className="ghost-button ghost-button-compact"><Copy size={14} />Duplicate</button>
                     </div>
                   </td>
                 </tr>
@@ -7870,6 +9918,176 @@ function VerificationView({
   );
 }
 
+function AgentAccessView({
+  state,
+  onConfigure,
+  onRegenerateToken
+}: {
+  state: BenchLocalAgentAccessState | null;
+  onConfigure: (input: { enabled: boolean; access?: BenchLocalAgentAccess; port?: number }) => void;
+  onRegenerateToken: () => void;
+}) {
+  const [enabledDraft, setEnabledDraft] = useState(state?.enabled ?? false);
+  const [accessDraft, setAccessDraft] = useState<BenchLocalAgentAccess>(state?.access ?? "localhost");
+  const [portDraft, setPortDraft] = useState(state?.configuredPort ? String(state.configuredPort) : "");
+
+  useEffect(() => {
+    setEnabledDraft(state?.enabled ?? false);
+    setAccessDraft(state?.access ?? "localhost");
+    setPortDraft(state?.configuredPort ? String(state.configuredPort) : "");
+  }, [state?.enabled, state?.access, state?.configuredPort]);
+
+  const apply = () => {
+    const normalizedPort = portDraft.trim() ? Number(portDraft.trim()) : undefined;
+    onConfigure({
+      enabled: enabledDraft,
+      access: accessDraft,
+      ...(Number.isFinite(normalizedPort) && normalizedPort ? { port: normalizedPort } : {})
+    });
+  };
+
+  const copyText = (value?: string) => {
+    if (!value || typeof navigator === "undefined") {
+      return;
+    }
+
+    void navigator.clipboard?.writeText(value);
+  };
+  const agentGuideUrl = state?.baseUrl ? `${state.baseUrl}/v1/agent-guide` : "";
+  const openApiUrl = state?.baseUrl ? `${state.baseUrl}/v1/openapi.json` : "";
+  const mcpUrl = state?.baseUrl ? `${state.baseUrl}/mcp` : "";
+  const httpEndpoints = [
+    ["POST", "/mcp"],
+    ["GET", "/v1/health"],
+    ["GET", "/v1/agent-guide"],
+    ["GET", "/v1/openapi.json"],
+    ["GET", "/v1/events"],
+    ["GET", "/v1/benchpacks"],
+    ["GET", "/v1/providers"],
+    ["POST", "/v1/providers"],
+    ["PATCH", "/v1/providers/:providerId"],
+    ["DELETE", "/v1/providers/:providerId"],
+    ["GET", "/v1/models"],
+    ["POST", "/v1/models"],
+    ["PATCH", "/v1/models/:modelId"],
+    ["DELETE", "/v1/models/:modelId"],
+    ["POST", "/v1/tabs/:tabId/models/availability/refresh"],
+    ["POST", "/v1/tabs/:tabId/sampling"],
+    ["POST", "/v1/tabs/:tabId/execution-mode"],
+    ["POST", "/v1/tabs/:tabId/runs"],
+    ["POST", "/v1/tabs/:tabId/runs/:runId/resume"],
+    ["POST", "/v1/tabs/:tabId/runs/:runId/retry-provider-errors"],
+    ["POST", "/v1/tabs/:tabId/runs/:runId/retry-failed-results"]
+  ] as const;
+
+  return (
+    <section className="advanced-grid">
+      <Panel title="Agent Access" subtitle="Local API and event stream for AI agents." tone="sky" icon={<Server size={16} />}>
+        <div className="agent-experimental-message">
+          <CircleAlert size={15} />
+          <span>
+            This feature is in experimental/preview stage. Feel free to report bugs.
+          </span>
+        </div>
+
+        <div className="agent-access-status-row">
+          <span className={`status-chip ${state?.running ? "status-ready" : "status-inactive"}`}>
+            {state?.running ? "running" : state?.enabled ? "stopped" : "disabled"}
+          </span>
+          {state?.baseUrl ? <span className="settings-row-secondary settings-mono-cell">{state.baseUrl}</span> : null}
+          {state ? <span className="status-chip status-idle">{state.access === "local_network" ? "local network" : "localhost"}</span> : null}
+          {state ? <span className="status-chip status-idle">{state.connectedClients} clients</span> : null}
+        </div>
+
+        <div className="entry-grid two-col">
+          <label className="field-block">
+            <span className="field-label">Access</span>
+            <select
+              className="config-input"
+              value={accessDraft}
+              onChange={(event) => setAccessDraft(event.target.value as BenchLocalAgentAccess)}
+            >
+              <option value="localhost">Localhost only</option>
+              <option value="local_network">Local network</option>
+            </select>
+          </label>
+          <FieldToggle label="Local Agent API" checked={enabledDraft} onChange={setEnabledDraft} />
+        </div>
+
+        <div className="entry-grid two-col">
+          <Field
+            label="Port"
+            value={portDraft}
+            placeholder="Auto"
+            type="number"
+            onChange={setPortDraft}
+          />
+        </div>
+
+        <div className="agent-field-row agent-field-row-token">
+          <Field label="Bearer Token" value={state?.token ?? ""} readOnly onChange={() => undefined} />
+          <button type="button" className="ghost-button ghost-button-compact" onClick={() => copyText(state?.token)} disabled={!state?.token}>
+            <Copy size={14} />
+            Copy
+          </button>
+          <button type="button" className="ghost-button ghost-button-compact" onClick={onRegenerateToken}>
+            <RotateCcw size={14} />
+            Regenerate
+          </button>
+        </div>
+
+        <div className="agent-field-row">
+          <Field label="Agent Guide URL" value={agentGuideUrl} readOnly onChange={() => undefined} />
+          <button type="button" className="ghost-button ghost-button-compact" onClick={() => copyText(agentGuideUrl)} disabled={!agentGuideUrl}>
+            <Copy size={14} />
+            Copy
+          </button>
+        </div>
+
+        <div className="agent-field-row">
+          <Field label="OpenAPI URL" value={openApiUrl} readOnly onChange={() => undefined} />
+          <button type="button" className="ghost-button ghost-button-compact" onClick={() => copyText(openApiUrl)} disabled={!openApiUrl}>
+            <Copy size={14} />
+            Copy
+          </button>
+        </div>
+
+        <div className="agent-field-row">
+          <Field label="MCP URL" value={mcpUrl} readOnly onChange={() => undefined} />
+          <button type="button" className="ghost-button ghost-button-compact" onClick={() => copyText(mcpUrl)} disabled={!mcpUrl}>
+            <Copy size={14} />
+            Copy
+          </button>
+        </div>
+
+        {state?.message ? (
+          <div className="helper-copy helper-copy-compact">
+            <p>{state.message}</p>
+          </div>
+        ) : null}
+
+        <div className="settings-actions">
+          <button type="button" className="primary-button" onClick={apply}>
+            <Save size={14} />
+            Save Setting
+          </button>
+        </div>
+      </Panel>
+
+      <Panel title="HTTP Surface" subtitle="Commands use JSON or MCP; live progress uses Server-Sent Events." tone="slate" icon={<Logs size={16} />}>
+        <div className="agent-endpoint-list">
+          {httpEndpoints.map(([method, path]) => (
+            <div key={`${method}-${path}`} className="agent-endpoint-row">
+              <span className={`agent-endpoint-method method-${method.toLowerCase()}`}>{method}</span>
+              <span className="agent-endpoint-path">{path}</span>
+            </div>
+          ))}
+        </div>
+      </Panel>
+    </section>
+  );
+}
+
 function Panel({
   title,
   subtitle,
@@ -7944,14 +10162,51 @@ function HistoryModal({
   entries,
   onClose,
   onOpenRun,
-  onRemoveAll
+  onDeleteSelected
 }: {
   benchPackName: string;
   entries: BenchPackRunHistoryEntry[];
   onClose: () => void;
   onOpenRun: (runId: string, mode: "history" | "replay") => void;
-  onRemoveAll: () => void;
+  onDeleteSelected: (runIds: string[]) => void;
 }) {
+  const entryRunIds = useMemo(() => entries.map((entry) => entry.runId), [entries]);
+  const [selectedRunIds, setSelectedRunIds] = useState<Set<string>>(() => new Set());
+  const selectedCount = selectedRunIds.size;
+  const allSelected = entries.length > 0 && selectedCount === entryRunIds.length;
+
+  useEffect(() => {
+    setSelectedRunIds((current) => {
+      const validRunIds = new Set(entryRunIds);
+      let changed = false;
+      const next = new Set<string>();
+
+      for (const runId of current) {
+        if (validRunIds.has(runId)) {
+          next.add(runId);
+        } else {
+          changed = true;
+        }
+      }
+
+      return changed ? next : current;
+    });
+  }, [entryRunIds]);
+
+  const toggleRunSelection = (runId: string, selected: boolean) => {
+    setSelectedRunIds((current) => {
+      const next = new Set(current);
+
+      if (selected) {
+        next.add(runId);
+      } else {
+        next.delete(runId);
+      }
+
+      return next;
+    });
+  };
+
   return (
     <div className="dialog-backdrop">
       <div className="dialog-shell history-dialog-shell">
@@ -7970,6 +10225,15 @@ function HistoryModal({
             <table className="settings-list-table">
               <thead>
                 <tr>
+                  <th className="history-select-column">
+                    <input
+                      type="checkbox"
+                      aria-label="Select all histories"
+                      checked={allSelected}
+                      disabled={entries.length === 0}
+                      onChange={(event) => setSelectedRunIds(event.target.checked ? new Set(entryRunIds) : new Set())}
+                    />
+                  </th>
                   <th>Date Time</th>
                   <th>Mode</th>
                   <th>Models</th>
@@ -7979,14 +10243,26 @@ function HistoryModal({
                 </tr>
               </thead>
               <tbody>
-                {entries.map((entry) => {
+                {entries.map((entry, index) => {
                   const executionModeLabel =
                     EXECUTION_MODE_OPTIONS.find((option) => option.value === entry.executionMode)?.label ?? "Unknown";
+                  const checkboxId = `history-select-${index}-${entry.runId.replace(/[^a-z0-9_-]/gi, "-")}`;
 
                   return (
                     <tr key={entry.runId}>
+                      <td className="history-select-column">
+                        <input
+                          id={checkboxId}
+                          type="checkbox"
+                          aria-label={`Select history ${new Date(entry.startedAt).toLocaleString()}`}
+                          checked={selectedRunIds.has(entry.runId)}
+                          onChange={(event) => toggleRunSelection(entry.runId, event.target.checked)}
+                        />
+                      </td>
                       <td>
-                        <div className="settings-row-primary">{new Date(entry.startedAt).toLocaleString()}</div>
+                        <label className="settings-row-primary history-time-toggle" htmlFor={checkboxId}>
+                          {new Date(entry.startedAt).toLocaleString()}
+                        </label>
                       </td>
                       <td>
                         <span className="status-chip status-idle">{executionModeLabel}</span>
@@ -8030,9 +10306,14 @@ function HistoryModal({
         </div>
 
         <div className="dialog-footer">
-          <button type="button" className="button-warn" onClick={onRemoveAll} disabled={entries.length === 0}>
+          <button
+            type="button"
+            className="ghost-button history-delete-selected-button"
+            onClick={() => onDeleteSelected(Array.from(selectedRunIds))}
+            disabled={selectedCount === 0}
+          >
             <Trash2 size={14} />
-            Remove All Histories
+            Delete Selected
           </button>
         </div>
       </div>
@@ -8084,7 +10365,41 @@ function VerifierPreparationModal({
   );
 }
 
-function Banner({ tone, children }: { tone: "success" | "danger" | "neutral" | "warning"; children: ReactNode }) {
+function ToastViewport({
+  messages,
+  onDismiss
+}: {
+  messages: ToastMessage[];
+  onDismiss: (id: string) => void;
+}) {
+  if (messages.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="toast-viewport" aria-live="polite" aria-atomic="false">
+      {messages.map((toast) => (
+        <div key={toast.id} className={`toast toast-${toast.tone}`} role={toast.tone === "danger" ? "alert" : "status"}>
+          <span className="toast-icon" aria-hidden="true">
+            {toast.tone === "danger" || toast.tone === "warning" ? <CircleAlert size={15} /> : <Check size={15} />}
+          </span>
+          <span className="toast-message">{toast.message}</span>
+          <button
+            type="button"
+            className="toast-dismiss"
+            onClick={() => onDismiss(toast.id)}
+            aria-label="Dismiss notification"
+            title="Dismiss"
+          >
+            <X size={14} />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Banner({ tone, children }: { tone: ToastTone; children: ReactNode }) {
   const toneClass =
     tone === "success"
       ? "banner-success"

@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -9,6 +10,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { Agent, setGlobalDispatcher } from "undici";
 import type {
   BenchPackRegistry,
   BenchPackRegistryEntry,
@@ -20,15 +22,19 @@ import type {
   GenerationRequest,
   HostContext,
   InferenceEndpoint,
+  ModelAvailability,
   BenchPackRunHistoryEntry,
   BenchPackRunSummary,
   ProgressEvent,
   RegisteredModel,
   ScenarioMeta,
   ScenarioResult,
+  SecretResolution,
   VerifierEndpoint,
   VerifierMode,
-  VerifierSpec
+  VerifierSpec,
+  WebBenchPackBridgePermission,
+  WebBenchPackManifestConfig
 } from "@benchlocal/core";
 import {
   expandHomePath,
@@ -50,6 +56,25 @@ const execFileAsync = promisify(execFile);
 let dockerExecutablePathPromise: Promise<string | null> | null = null;
 const verifierContainerLocks = new Map<string, Promise<void>>();
 const runSummaryLocks = new Map<string, Promise<void>>();
+const MODEL_AVAILABILITY_PROBE_TIMEOUT_MS = 4000;
+type ProviderFetchCaptureContext = {
+  providerBaseUrls: string[];
+  providerHttpErrors: CapturedProviderHttpError[];
+};
+
+type CapturedProviderHttpError = {
+  status: number;
+  responseBlank: boolean;
+};
+
+const providerFetchCaptureContext = new AsyncLocalStorage<ProviderFetchCaptureContext>();
+let providerFetchCaptureInstalled = false;
+
+// Bench Packs commonly use global fetch; Undici otherwise applies a hidden 300s cap.
+setGlobalDispatcher(new Agent({
+  bodyTimeout: 0,
+  headersTimeout: 0
+}));
 
 type DockerRuntimeAvailability = {
   state: "ready" | "not_installed" | "not_running";
@@ -320,7 +345,12 @@ function isBenchPackRegistryEntry(value: unknown): value is BenchPackRegistryEnt
     typeof source === "object" &&
     source !== null &&
     ((source.type === "github" && typeof source.repo === "string" && typeof source.tag === "string") ||
-      (source.type === "archive" && typeof source.url === "string"))
+      (source.type === "archive" && typeof source.url === "string") ||
+      (source.type === "web" &&
+        typeof source.entry === "string" &&
+        (source.manifest === undefined || typeof source.manifest === "string") &&
+        (source.integrity === undefined || typeof source.integrity === "string") &&
+        (source.buildId === undefined || typeof source.buildId === "string")))
   );
 }
 
@@ -939,19 +969,83 @@ async function resolveConfiguredBenchPackRoot(config: BenchLocalConfig, benchPac
   return undefined;
 }
 
-function isBenchPackManifest(value: unknown): value is BenchPackManifest {
+function getBenchPackManifestType(manifest: BenchPackManifest): "table" | "web" {
+  return manifest.type ?? "table";
+}
+
+function isHttpsUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function isAllowedWebPackUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+
+    if (url.protocol === "https:") {
+      return true;
+    }
+
+    return (
+      url.protocol === "http:" &&
+      (url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "::1")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isWebBenchPackBridgePermission(value: unknown): value is WebBenchPackBridgePermission {
+  return (
+    value === "models:list" ||
+    value === "models:read" ||
+    value === "inference:chat" ||
+    value === "inference:stream" ||
+    value === "runs:write" ||
+    value === "history:read" ||
+    value === "history:write" ||
+    value === "artifacts:write"
+  );
+}
+
+function isWebBenchPackManifestConfig(value: unknown): value is WebBenchPackManifestConfig {
   if (typeof value !== "object" || value === null) {
     return false;
   }
 
   const candidate = value as Record<string, unknown>;
   return (
+    candidate.bridgeVersion === 1 &&
+    Array.isArray(candidate.allowedOrigins) &&
+    candidate.allowedOrigins.every((origin) => typeof origin === "string" && isAllowedWebPackUrl(origin)) &&
+    Array.isArray(candidate.permissions) &&
+    candidate.permissions.every(isWebBenchPackBridgePermission) &&
+    (candidate.historyPlayback === undefined || typeof candidate.historyPlayback === "boolean") &&
+    (candidate.buildId === undefined || typeof candidate.buildId === "string") &&
+    (candidate.manifestHash === undefined || typeof candidate.manifestHash === "string")
+  );
+}
+
+function isBenchPackManifest(value: unknown): value is BenchPackManifest {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const candidate = value as Record<string, unknown>;
+  const manifestType = candidate.type ?? "table";
+  return (
     candidate.schemaVersion === 1 &&
     candidate.protocolVersion === 1 &&
+    (manifestType === "table" || manifestType === "web") &&
     typeof candidate.id === "string" &&
     typeof candidate.name === "string" &&
     typeof candidate.version === "string" &&
     typeof candidate.entry === "string" &&
+    (manifestType !== "web" || (isAllowedWebPackUrl(candidate.entry) && isWebBenchPackManifestConfig(candidate.web))) &&
     (candidate.requirements === undefined || isBenchPackCompatibilityRequirements(candidate.requirements)) &&
     typeof candidate.capabilities === "object" &&
     candidate.capabilities !== null &&
@@ -1057,6 +1151,18 @@ async function inspectBenchPack(
       status: "incompatible" as BenchPackInspection["status"],
       manifest,
       error: compatibilityError
+    };
+  }
+
+  if (getBenchPackManifestType(manifest) === "web") {
+    return {
+      id: benchPackId,
+      source: benchPackConfig.source,
+      rootDir,
+      status: "ready",
+      manifest,
+      scenarioCount: 0,
+      scenarios: []
     };
   }
 
@@ -1341,16 +1447,226 @@ async function stageBenchPackArchiveInstall(
       throw new Error(compatibilityError);
     }
 
-    const entryPath = path.resolve(versionStageDir, manifest.entry);
+    if (getBenchPackManifestType(manifest) === "table") {
+      const entryPath = path.resolve(versionStageDir, manifest.entry);
 
-    if (!(await pathExists(entryPath))) {
-      throw new Error(`Bench Pack entry is missing: ${entryPath}`);
+      if (!(await pathExists(entryPath))) {
+        throw new Error(`Bench Pack entry is missing: ${entryPath}`);
+      }
     }
 
     return {
       stagingRoot,
       stagedDir: versionStageDir,
       manifest
+    };
+  } catch (error) {
+    await fs.rm(stagingRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function getUrlOrigin(value: string): string {
+  return new URL(value).origin;
+}
+
+function createWebBenchPackManifestFromRegistryEntry(entry: BenchPackRegistryEntry): BenchPackManifest {
+  if (entry.source.type !== "web") {
+    throw new Error(`Bench Pack "${entry.id}" does not declare a web source.`);
+  }
+
+  if (!isHttpsUrl(entry.source.entry)) {
+    throw new Error(`Web Bench Pack "${entry.id}" must use an https entry URL.`);
+  }
+
+  return {
+    schemaVersion: 1,
+    protocolVersion: 1,
+    type: "web",
+    id: entry.id,
+    name: entry.name,
+    author: entry.author,
+    version: entry.version,
+    description: entry.description,
+    entry: entry.source.entry,
+    web: {
+      bridgeVersion: 1,
+      allowedOrigins: [getUrlOrigin(entry.source.entry)],
+      permissions: [
+        "models:list",
+        "models:read",
+        "inference:chat",
+        "inference:stream",
+        "runs:write",
+        "history:read",
+        "history:write",
+        "artifacts:write"
+      ],
+      historyPlayback: true,
+      buildId: entry.source.buildId
+    },
+    capabilities: {
+      tools: entry.capabilities?.tools ?? true,
+      multiTurn: entry.capabilities?.multiTurn ?? true,
+      streamingProgress: true,
+      verification: entry.capabilities?.verification ?? false
+    }
+  };
+}
+
+async function fetchWebBenchPackManifest(entry: BenchPackRegistryEntry): Promise<BenchPackManifest> {
+  if (entry.source.type !== "web" || !entry.source.manifest) {
+    return createWebBenchPackManifestFromRegistryEntry(entry);
+  }
+
+  if (!isHttpsUrl(entry.source.manifest)) {
+    throw new Error(`Web Bench Pack "${entry.id}" must use an https manifest URL.`);
+  }
+
+  const response = await fetch(entry.source.manifest, {
+    method: "GET",
+    headers: {
+      accept: "application/json"
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch Web Bench Pack manifest (${response.status}).`);
+  }
+
+  const parsed = (await response.json()) as unknown;
+
+  if (!isBenchPackManifest(parsed)) {
+    throw new Error(`Web Bench Pack "${entry.id}" returned an invalid manifest.`);
+  }
+
+  if (getBenchPackManifestType(parsed) !== "web") {
+    throw new Error(`Web Bench Pack "${entry.id}" manifest must declare type "web".`);
+  }
+
+  if (parsed.id !== entry.id) {
+    throw new Error(`Web Bench Pack manifest id "${parsed.id}" does not match registry id "${entry.id}".`);
+  }
+
+  if (parsed.version !== entry.version) {
+    throw new Error(`Web Bench Pack manifest version "${parsed.version}" does not match registry version "${entry.version}".`);
+  }
+
+  return parsed;
+}
+
+async function stageWebBenchPackRegistryInstall(
+  entry: BenchPackRegistryEntry,
+  reporter: InstallProgressReporter | undefined,
+  action: BenchPackInstallAction,
+  runtime?: BenchLocalRuntimeCompatibility
+): Promise<{ stagingRoot: string; stagedDir: string; manifest: BenchPackManifest }> {
+  const stagingRoot = path.join(os.tmpdir(), `benchlocal-web-benchpack-${randomUUID().slice(0, 8)}`);
+  const versionKey = `${sanitizeBenchPackVersion(entry.version)}-${randomUUID().slice(0, 8)}`;
+  const versionStageDir = path.join(stagingRoot, versionKey);
+
+  await fs.mkdir(versionStageDir, { recursive: true });
+
+  try {
+    await reportInstallProgress(reporter, {
+      benchPackId: entry.id,
+      action,
+      phase: "downloading",
+      message: "Fetching Web Bench Pack manifest."
+    });
+    const manifest = await fetchWebBenchPackManifest(entry);
+    await reportInstallProgress(reporter, {
+      benchPackId: entry.id,
+      action,
+      phase: "validating",
+      message: "Validating Web Bench Pack manifest."
+    });
+    const compatibilityError = getBenchPackCompatibilityError(manifest, runtime);
+
+    if (compatibilityError) {
+      throw new Error(compatibilityError);
+    }
+
+    await fs.writeFile(path.join(versionStageDir, "benchlocal.pack.json"), JSON.stringify(manifest, null, 2), "utf8");
+
+    return {
+      stagingRoot,
+      stagedDir: versionStageDir,
+      manifest
+    };
+  } catch (error) {
+    await fs.rm(stagingRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function isLikelyJsonUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.pathname.toLowerCase().endsWith(".json");
+  } catch {
+    return false;
+  }
+}
+
+async function stageWebBenchPackManifestUrlInstall(
+  manifestUrl: string,
+  reporter: InstallProgressReporter | undefined,
+  action: BenchPackInstallAction,
+  runtime?: BenchLocalRuntimeCompatibility
+): Promise<{ stagingRoot: string; stagedDir: string; manifest: BenchPackManifest } | null> {
+  if (!isAllowedWebPackUrl(manifestUrl) || !isLikelyJsonUrl(manifestUrl)) {
+    return null;
+  }
+
+  const stagingRoot = path.join(os.tmpdir(), `benchlocal-web-benchpack-${randomUUID().slice(0, 8)}`);
+
+  try {
+    await reportInstallProgress(reporter, {
+      benchPackId: "third-party",
+      action,
+      phase: "downloading",
+      message: "Fetching Web Bench Pack manifest."
+    });
+
+    const response = await fetch(manifestUrl, {
+      method: "GET",
+      headers: {
+        accept: "application/json"
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch Web Bench Pack manifest (${response.status}).`);
+    }
+
+    const parsed = (await response.json()) as unknown;
+
+    if (!isBenchPackManifest(parsed) || getBenchPackManifestType(parsed) !== "web") {
+      throw new Error("URL did not return a valid Web Bench Pack manifest.");
+    }
+
+    await reportInstallProgress(reporter, {
+      benchPackId: parsed.id,
+      action,
+      phase: "validating",
+      message: "Validating Web Bench Pack manifest."
+    });
+
+    const compatibilityError = getBenchPackCompatibilityError(parsed, runtime);
+
+    if (compatibilityError) {
+      throw new Error(compatibilityError);
+    }
+
+    const versionStageDir = path.join(stagingRoot, `${sanitizeBenchPackVersion(parsed.version)}-${randomUUID().slice(0, 8)}`);
+    await fs.mkdir(versionStageDir, { recursive: true });
+    await fs.writeFile(path.join(versionStageDir, "benchlocal.pack.json"), JSON.stringify(parsed, null, 2), "utf8");
+
+    return {
+      stagingRoot,
+      stagedDir: versionStageDir,
+      manifest: parsed
     };
   } catch (error) {
     await fs.rm(stagingRoot, { recursive: true, force: true });
@@ -1404,10 +1720,17 @@ export async function installBenchPackFromRegistry(
     throw new Error(`Bench Pack "${benchPackId}" was not found in the official registry.`);
   }
 
-  const archiveUrl =
-    entry.source.type === "github" ? getGitHubArchiveUrl(entry.source.repo, entry.source.tag) : entry.source.url;
   const baseDir = getBenchPackBaseDir(config, benchPackId);
-  const staged = await stageBenchPackArchiveInstall(entry.version, archiveUrl, reporter, "install", benchPackId, runtime);
+  const staged = entry.source.type === "web"
+    ? await stageWebBenchPackRegistryInstall(entry, reporter, "install", runtime)
+    : await stageBenchPackArchiveInstall(
+        entry.version,
+        entry.source.type === "github" ? getGitHubArchiveUrl(entry.source.repo, entry.source.tag) : entry.source.url,
+        reporter,
+        "install",
+        benchPackId,
+        runtime
+      );
   const rootDir = await commitStagedBenchPackInstall(config, benchPackId, entry.version, staged.stagedDir, staged.stagingRoot);
   const manifest = staged.manifest;
   await reportInstallProgress(reporter, {
@@ -1458,10 +1781,17 @@ export async function updateBenchPackFromRegistry(
     throw new Error(`Bench Pack "${benchPackId}" was not found in the official registry.`);
   }
 
-  const archiveUrl =
-    entry.source.type === "github" ? getGitHubArchiveUrl(entry.source.repo, entry.source.tag) : entry.source.url;
   const baseDir = getBenchPackBaseDir(config, benchPackId);
-  const staged = await stageBenchPackArchiveInstall(entry.version, archiveUrl, reporter, "update", benchPackId, runtime);
+  const staged = entry.source.type === "web"
+    ? await stageWebBenchPackRegistryInstall(entry, reporter, "update", runtime)
+    : await stageBenchPackArchiveInstall(
+        entry.version,
+        entry.source.type === "github" ? getGitHubArchiveUrl(entry.source.repo, entry.source.tag) : entry.source.url,
+        reporter,
+        "update",
+        benchPackId,
+        runtime
+      );
   await reportInstallProgress(reporter, {
     benchPackId,
     action: "update",
@@ -1522,7 +1852,9 @@ export async function installBenchPackFromUrl(
     message: "Resolving Bench Pack from URL."
   });
 
-  const staged = await stageBenchPackArchiveInstall("url", normalizedUrl, reporter, "install", "third-party", runtime);
+  const staged =
+    (await stageWebBenchPackManifestUrlInstall(normalizedUrl, reporter, "install", runtime)) ??
+    (await stageBenchPackArchiveInstall("url", normalizedUrl, reporter, "install", "third-party", runtime));
   const manifest = staged.manifest;
   const benchPackId = manifest.id;
   const rootDir = await commitStagedBenchPackInstall(config, benchPackId, manifest.version, staged.stagedDir, staged.stagingRoot);
@@ -1668,6 +2000,10 @@ async function loadConfiguredBenchPack(
     throw new Error(compatibilityError);
   }
 
+  if (getBenchPackManifestType(manifest) === "web") {
+    throw new Error(`Web Bench Pack "${benchPackId}" must be opened in the interactive web surface.`);
+  }
+
   const entryPath = path.resolve(rootDir, manifest.entry);
 
   if (!(await pathExists(entryPath))) {
@@ -1736,30 +2072,310 @@ async function appendTextLine(targetPath: string, value: string): Promise<void> 
 }
 
 async function writeRunSummary(summaryPath: string, summary: BenchPackRunSummary): Promise<void> {
-  await fs.writeFile(summaryPath, JSON.stringify(summary, null, 2), "utf8");
+  await fs.writeFile(summaryPath, JSON.stringify(normalizeRunSummaryProviderErrorClassification(summary), null, 2), "utf8");
 }
 
 function toErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown benchmark error.";
 }
 
-function isAuthProviderErrorMessage(message: string): boolean {
-  return /(^|\D)(401|403)(\D|$)|unauthori[sz]ed|forbidden|auth|api key|invalid[_ -]?key|permission denied/i.test(message);
+function isRetryableProviderHttpStatus(status: number): boolean {
+  return status === 408 || status === 409 || status === 425 || status === 429 || (status >= 500 && status <= 599);
 }
 
-function isRetryableProviderErrorMessage(message: string): boolean {
-  if (isAuthProviderErrorMessage(message)) {
+function isProviderHttpErrorStatus(status: number): boolean {
+  return status >= 400 && status <= 599;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function getFetchRequestUrl(input: Parameters<typeof fetch>[0]): string | undefined {
+  if (typeof input === "string") {
+    return input;
+  }
+
+  if (input instanceof URL) {
+    return input.href;
+  }
+
+  if (typeof Request !== "undefined" && input instanceof Request) {
+    return input.url;
+  }
+
+  return undefined;
+}
+
+function normalizeUrlPrefix(value: string): string | undefined {
+  try {
+    const url = new URL(value.endsWith("/") ? value : `${value}/`);
+    return url.href;
+  } catch {
+    return undefined;
+  }
+}
+
+function isProviderFetchRequest(input: Parameters<typeof fetch>[0], providerBaseUrls: string[]): boolean {
+  const requestUrl = getFetchRequestUrl(input);
+
+  if (!requestUrl) {
     return false;
   }
 
-  return (
-    /fetch failed|network|econn|etimedout|timed out|timeout|socket|connection|upstream provider|provider.*unavailable/i.test(message) ||
-    /(^|\D)(408|409|425|429|5\d\d)(\D|$)/.test(message)
-  );
+  const normalizedRequestUrl = normalizeUrlPrefix(requestUrl);
+
+  if (!normalizedRequestUrl) {
+    return false;
+  }
+
+  return providerBaseUrls.some((providerBaseUrl) => {
+    const normalizedProviderUrl = normalizeUrlPrefix(providerBaseUrl);
+    return normalizedProviderUrl ? normalizedRequestUrl.startsWith(normalizedProviderUrl) : false;
+  });
+}
+
+function createBlankProviderHttpStatusError(response: Response): Error {
+  const error = new Error(`Provider returned HTTP status ${response.status} with a blank response.`);
+  const headers = {
+    "content-length": response.headers.get("content-length") ?? "0"
+  };
+
+  Object.assign(error, {
+    status: response.status,
+    response: {
+      status: response.status,
+      statusCode: response.status,
+      body: "",
+      headers
+    }
+  });
+
+  return error;
+}
+
+function captureProviderHttpError(response: Response, responseBlank: boolean): void {
+  if (!isProviderHttpErrorStatus(response.status)) {
+    return;
+  }
+
+  providerFetchCaptureContext.getStore()?.providerHttpErrors.push({
+    status: response.status,
+    responseBlank
+  });
+}
+
+function throwIfBlankRetryableProviderResponse(response: Response, payload: string | ArrayBuffer): void {
+  const blankPayload = typeof payload === "string"
+    ? payload.trim().length === 0
+    : payload.byteLength === 0;
+
+  if (blankPayload) {
+    captureProviderHttpError(response, true);
+  }
+
+  if (blankPayload && isRetryableProviderHttpStatus(response.status)) {
+    throw createBlankProviderHttpStatusError(response);
+  }
+}
+
+function wrapProviderHttpResponse(response: Response): Response {
+  const readText = response.text.bind(response);
+  const readArrayBuffer = response.arrayBuffer.bind(response);
+  const cloneResponse = response.clone.bind(response);
+
+  Object.defineProperties(response, {
+    clone: {
+      value: () => wrapProviderHttpResponse(cloneResponse())
+    },
+    text: {
+      value: async () => {
+        const text = await readText();
+        throwIfBlankRetryableProviderResponse(response, text);
+        return text;
+      }
+    },
+    json: {
+      value: async () => {
+        const text = await response.text();
+        return JSON.parse(text) as unknown;
+      }
+    },
+    arrayBuffer: {
+      value: async () => {
+        const buffer = await readArrayBuffer();
+        throwIfBlankRetryableProviderResponse(response, buffer);
+        return buffer;
+      }
+    }
+  });
+
+  return response;
+}
+
+function installProviderFetchCapture(): void {
+  if (providerFetchCaptureInstalled) {
+    return;
+  }
+
+  const nativeFetch = globalThis.fetch.bind(globalThis);
+
+  globalThis.fetch = (async (input, init) => {
+    const response = await nativeFetch(input, init);
+    const context = providerFetchCaptureContext.getStore();
+
+    if (!context || !isProviderFetchRequest(input, context.providerBaseUrls) || !isProviderHttpErrorStatus(response.status)) {
+      return response;
+    }
+
+    captureProviderHttpError(response, hasBlankContentLength(response));
+
+    return wrapProviderHttpResponse(response);
+  }) as typeof fetch;
+  providerFetchCaptureInstalled = true;
+}
+
+async function captureProviderFetchErrors<T>(
+  providerBaseUrl: string | undefined,
+  operation: () => Promise<T>
+): Promise<{ result: T; providerHttpError?: CapturedProviderHttpError }> {
+  if (!providerBaseUrl) {
+    return { result: await operation() };
+  }
+
+  installProviderFetchCapture();
+  const context: ProviderFetchCaptureContext = {
+    providerBaseUrls: [providerBaseUrl],
+    providerHttpErrors: []
+  };
+  const result = await providerFetchCaptureContext.run(context, operation);
+
+  return {
+    result,
+    providerHttpError: context.providerHttpErrors.at(-1)
+  };
+}
+
+function toHttpStatusCode(value: unknown): number | undefined {
+  const status = typeof value === "number"
+    ? value
+    : typeof value === "string" && /^\d{3}$/.test(value.trim())
+      ? Number(value)
+      : undefined;
+
+  return status !== undefined && Number.isInteger(status) && status >= 100 && status <= 599 ? status : undefined;
+}
+
+function getStructuredHttpStatusCode(value: unknown, depth = 0): number | undefined {
+  if (!isRecord(value) || depth > 2) {
+    return undefined;
+  }
+
+  const directStatus = toHttpStatusCode(value.status ?? value.statusCode);
+  if (directStatus !== undefined) {
+    return directStatus;
+  }
+
+  return getStructuredHttpStatusCode(value.response, depth + 1) ?? getStructuredHttpStatusCode(value.cause, depth + 1);
+}
+
+function isBlankPayloadValue(value: unknown): boolean {
+  if (value === undefined || value === null) {
+    return true;
+  }
+
+  if (typeof value === "string") {
+    return value.trim().length === 0;
+  }
+
+  if (value instanceof Uint8Array || value instanceof ArrayBuffer) {
+    return value.byteLength === 0;
+  }
+
+  return false;
+}
+
+function hasNonBlankResponsePayload(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  return ["body", "responseBody", "data", "error"].some((key) => key in value && !isBlankPayloadValue(value[key]));
+}
+
+function hasResponsePayloadMarker(value: unknown): boolean {
+  return isRecord(value) && ["body", "responseBody", "data", "error"].some((key) => key in value);
+}
+
+function getHeaderValue(headers: unknown, name: string): string | undefined {
+  if (!headers) {
+    return undefined;
+  }
+
+  if (headers instanceof Headers) {
+    return headers.get(name) ?? undefined;
+  }
+
+  if (isRecord(headers)) {
+    const directValue = headers[name] ?? headers[name.toLowerCase()];
+    return typeof directValue === "string" ? directValue : undefined;
+  }
+
+  if (typeof (headers as { get?: unknown }).get === "function") {
+    const value = (headers as { get: (headerName: string) => unknown }).get(name);
+    return typeof value === "string" ? value : undefined;
+  }
+
+  return undefined;
+}
+
+function hasBlankContentLength(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  const contentLength = getHeaderValue(value.headers, "content-length");
+  return contentLength?.trim() === "0";
+}
+
+function hasBlankProviderResponse(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  const response = value.response;
+
+  if (hasNonBlankResponsePayload(value) || hasNonBlankResponsePayload(response)) {
+    return false;
+  }
+
+  return hasResponsePayloadMarker(value) ||
+    hasResponsePayloadMarker(response) ||
+    hasBlankContentLength(value) ||
+    hasBlankContentLength(response);
+}
+
+function getProviderHttpErrorFromError(error: unknown): CapturedProviderHttpError | undefined {
+  const status = getStructuredHttpStatusCode(error);
+
+  if (status === undefined || !isProviderHttpErrorStatus(status)) {
+    return undefined;
+  }
+
+  return {
+    status,
+    responseBlank: hasBlankProviderResponse(error)
+  };
 }
 
 function formatRequestTimeoutMessage(timeoutSeconds: number): string {
   return `The model did not complete the answer within the configured request timeout (${timeoutSeconds} seconds).`;
+}
+
+function createRequestTimeoutError(timeoutSeconds: number): Error {
+  const error = new Error(formatRequestTimeoutMessage(timeoutSeconds));
+  error.name = "TimeoutError";
+  return error;
 }
 
 function toScenarioExecutionErrorMessage(error: unknown, generation: GenerationRequest | undefined, startedAt: number): string {
@@ -1789,6 +2405,16 @@ function throwIfAborted(signal?: AbortSignal): void {
   }
 
   throw createAbortError(signal);
+}
+
+function getRequestTimeoutSeconds(generation?: GenerationRequest): number | undefined {
+  const timeoutSeconds = generation?.request_timeout_seconds;
+
+  if (!timeoutSeconds || !Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
+    return undefined;
+  }
+
+  return timeoutSeconds;
 }
 
 function compactGenerationRequest(input?: GenerationRequest): GenerationRequest {
@@ -1896,6 +2522,24 @@ function getHistoricalRunModelIds(summary: BenchPackRunSummary): string[] {
   return orderedModelIds;
 }
 
+function getProviderBaseUrlById(providers: HostContext["providers"]): Map<string, string> {
+  return new Map(providers.map((provider) => [provider.id, provider.baseUrl]));
+}
+
+function fallbackProviderDisplayName(providerId: string): string {
+  const trimmed = providerId.trim();
+
+  if (/^openai[_-]compatible-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed)) {
+    return "OpenAI Compatible";
+  }
+
+  return trimmed || "Unknown Provider";
+}
+
+function getProviderDisplayName(provider: HostContext["providers"][number] | undefined, providerId: string): string {
+  return provider?.name?.trim() || fallbackProviderDisplayName(providerId);
+}
+
 function mergeSummaryEvents(current: ProgressEvent[], persisted?: ProgressEvent[]): ProgressEvent[] {
   if (!persisted || persisted.length <= current.length) {
     return current;
@@ -1927,6 +2571,286 @@ function createHostLogger(benchPackId: string, hostLogPath: string): HostContext
 
 function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+}
+
+function providerModelsUrl(baseUrl: string): string {
+  return new URL("models", normalizeBaseUrl(baseUrl)).toString();
+}
+
+function createProviderProbeHeaders(secret?: SecretResolution): Headers {
+  const headers = new Headers({
+    Accept: "application/json"
+  });
+
+  if (secret?.value) {
+    headers.set("authorization", `Bearer ${secret.value}`);
+  }
+
+  return headers;
+}
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  abortSignal?: AbortSignal
+): Promise<Response> {
+  const controller = new AbortController();
+  let timeout: NodeJS.Timeout | undefined;
+  const abortFromParent = () => {
+    controller.abort(abortSignal?.reason ?? createAbortError(abortSignal));
+  };
+
+  if (abortSignal) {
+    if (abortSignal.aborted) {
+      abortFromParent();
+    } else {
+      abortSignal.addEventListener("abort", abortFromParent, { once: true });
+    }
+  }
+
+  timeout = setTimeout(() => {
+    controller.abort(new Error(`Provider did not respond within ${Math.ceil(timeoutMs / 1000)} seconds.`));
+  }, timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal
+    });
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+    abortSignal?.removeEventListener("abort", abortFromParent);
+  }
+}
+
+function getDiscoveredModelIds(payload: unknown): Set<string> {
+  const record = payload && typeof payload === "object" && !Array.isArray(payload)
+    ? payload as Record<string, unknown>
+    : null;
+  const entries = Array.isArray(payload)
+    ? payload
+    : Array.isArray(record?.data)
+      ? record.data
+      : Array.isArray(record?.models)
+        ? record.models
+        : [];
+  const ids = entries.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") {
+      return [];
+    }
+
+    const model = entry as Record<string, unknown>;
+    const id = typeof model.id === "string" ? model.id.trim() : "";
+    const name = typeof model.name === "string" ? model.name.trim() : "";
+
+    return [id, name].filter(Boolean);
+  });
+
+  return new Set(ids);
+}
+
+function createModelAvailability(
+  model: RegisteredModel,
+  status: ModelAvailability["status"],
+  reason: ModelAvailability["reason"],
+  checkedAt: string,
+  details?: string
+): ModelAvailability {
+  return {
+    modelId: model.id,
+    providerId: model.provider,
+    status,
+    reason,
+    details,
+    checkedAt
+  };
+}
+
+function createRuntimeProviders(config: BenchLocalConfig): HostContext["providers"] {
+  return Object.entries(config.providers).map(([id, provider]) => ({
+    id,
+    kind: provider.kind,
+    name: provider.name,
+    enabled: provider.enabled,
+    baseUrl: provider.base_url,
+    authMode: (provider.api_key || provider.api_key_env ? "bearer" : "none") as "bearer" | "none"
+  }));
+}
+
+function createRuntimeModels(config: BenchLocalConfig): HostContext["models"] {
+  return config.models.filter((model) => model.enabled).map((model) => ({
+    id: model.id,
+    provider: model.provider,
+    model: model.model,
+    label: model.label,
+    enabled: model.enabled,
+    group: model.group
+  }));
+}
+
+async function createRuntimeSecrets(config: BenchLocalConfig): Promise<HostContext["secrets"]> {
+  return await Promise.all(
+    Object.entries(config.providers).map(async ([providerId, provider]) => {
+      const envName = provider.api_key_env;
+      const envValue = envName ? process.env[envName] : undefined;
+      const value = provider.api_key ?? envValue;
+
+      return {
+        providerId,
+        keyName: envName ?? "api_key",
+        value,
+        source: provider.api_key ? "config" : envValue ? "env" : "none"
+      } as const;
+    })
+  );
+}
+
+async function checkModelAvailability(
+  providers: HostContext["providers"],
+  models: HostContext["models"],
+  secrets: HostContext["secrets"],
+  options?: {
+    modelIds?: string[];
+    timeoutMs?: number;
+    abortSignal?: AbortSignal;
+  }
+): Promise<ModelAvailability[]> {
+  const selectedModelIds = options?.modelIds && options.modelIds.length > 0 ? new Set(options.modelIds) : null;
+  const selectedModels = selectedModelIds ? models.filter((model) => selectedModelIds.has(model.id)) : models;
+  const providerMap = new Map(providers.map((provider) => [provider.id, provider]));
+  const secretMap = new Map(secrets.map((secret) => [secret.providerId, secret]));
+  const groupedModels = new Map<string, RegisteredModel[]>();
+  const timeoutMs = options?.timeoutMs ?? MODEL_AVAILABILITY_PROBE_TIMEOUT_MS;
+  const checkedAt = new Date().toISOString();
+  const results: ModelAvailability[] = [];
+
+  for (const model of selectedModels) {
+    const existing = groupedModels.get(model.provider) ?? [];
+    existing.push(model);
+    groupedModels.set(model.provider, existing);
+  }
+
+  await Promise.all(Array.from(groupedModels.entries()).map(async ([providerId, providerModels]) => {
+    throwIfAborted(options?.abortSignal);
+
+    const provider = providerMap.get(providerId);
+
+    if (!provider) {
+      results.push(
+        ...providerModels.map((model) =>
+          createModelAvailability(model, "offline", "provider_missing", checkedAt, `Provider "${getProviderDisplayName(provider, providerId)}" was not found.`)
+        )
+      );
+      return;
+    }
+
+    const providerName = getProviderDisplayName(provider, providerId);
+
+    if (!provider.enabled) {
+      results.push(
+        ...providerModels.map((model) =>
+          createModelAvailability(model, "offline", "provider_disabled", checkedAt, `Provider "${providerName}" is disabled.`)
+        )
+      );
+      return;
+    }
+
+    const secret = secretMap.get(provider.id);
+
+    if (provider.authMode === "bearer" && !secret?.value) {
+      results.push(
+        ...providerModels.map((model) =>
+          createModelAvailability(model, "offline", "auth_missing", checkedAt, `Provider "${providerName}" requires an API key.`)
+        )
+      );
+      return;
+    }
+
+    let response: Response;
+    try {
+      response = await fetchWithTimeout(
+        providerModelsUrl(provider.baseUrl),
+        {
+          method: "GET",
+          headers: createProviderProbeHeaders(secret)
+        },
+        timeoutMs,
+        options?.abortSignal
+      );
+    } catch (error) {
+      if (options?.abortSignal?.aborted) {
+        throw error;
+      }
+
+      results.push(
+        ...providerModels.map((model) =>
+          createModelAvailability(model, "offline", "provider_unreachable", checkedAt, `Provider "${providerName}" is unreachable: ${toErrorMessage(error)}`)
+        )
+      );
+      return;
+    }
+
+    if (!response.ok) {
+      results.push(
+        ...providerModels.map((model) =>
+          createModelAvailability(model, "offline", "provider_error", checkedAt, `Provider "${providerName}" returned ${response.status} ${response.statusText}`.trim())
+        )
+      );
+      return;
+    }
+
+    let payload: unknown;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      results.push(
+        ...providerModels.map((model) =>
+          createModelAvailability(model, "offline", "provider_error", checkedAt, `Provider "${providerName}" returned invalid model metadata: ${toErrorMessage(error)}`)
+        )
+      );
+      return;
+    }
+
+    const availableModelIds = getDiscoveredModelIds(payload);
+
+    for (const model of providerModels) {
+      if (availableModelIds.has(model.model) || availableModelIds.has(model.id)) {
+        results.push(createModelAvailability(model, "online", "available", checkedAt));
+        continue;
+      }
+
+      results.push(
+        createModelAvailability(
+          model,
+          "offline",
+          "model_missing",
+          checkedAt,
+          `Provider "${providerName}" is reachable, but model "${model.model}" is not listed.`
+        )
+      );
+    }
+  }));
+
+  return results.sort((left, right) => left.modelId.localeCompare(right.modelId));
+}
+
+export async function checkConfiguredModelAvailability(
+  config: BenchLocalConfig,
+  options?: {
+    modelIds?: string[];
+    timeoutMs?: number;
+    abortSignal?: AbortSignal;
+  }
+): Promise<ModelAvailability[]> {
+  return await checkModelAvailability(
+    createRuntimeProviders(config),
+    createRuntimeModels(config),
+    await createRuntimeSecrets(config),
+    options
+  );
 }
 
 function normalizeInferencePath(pathname: string): string {
@@ -2049,6 +2973,7 @@ async function startInferenceRelay(
 
   for (const model of models) {
     const provider = providerMap.get(model.provider);
+    const providerName = getProviderDisplayName(provider, model.provider);
 
     if (!provider) {
       failedEndpoints.push({
@@ -2056,7 +2981,7 @@ async function startInferenceRelay(
         providerId: model.provider,
         transport: "openai_compatible",
         status: "failed",
-        details: `Provider "${model.provider}" was not found.`
+        details: `Provider "${providerName}" was not found.`
       });
       continue;
     }
@@ -2067,7 +2992,7 @@ async function startInferenceRelay(
         providerId: model.provider,
         transport: "openai_compatible",
         status: "failed",
-        details: `Provider "${model.provider}" is configured but disabled.`
+        details: `Provider "${providerName}" is configured but disabled.`
       });
       continue;
     }
@@ -2079,7 +3004,7 @@ async function startInferenceRelay(
         providerId: model.provider,
         transport: "openai_compatible",
         status: "failed",
-        details: `Provider "${model.provider}" requires an API key, but no secret is available.`
+        details: `Provider "${providerName}" requires an API key, but no secret is available.`
       });
       continue;
     }
@@ -2361,38 +3286,9 @@ async function createHostContext(
 ): Promise<HostContextResources> {
   const benchPackConfig = config.benchpacks[benchPackId];
   const logger = createHostLogger(benchPackId, artifacts.hostLogPath);
-  const providers = Object.entries(config.providers).map(([id, provider]) => ({
-    id,
-    kind: provider.kind,
-    name: provider.name,
-    enabled: provider.enabled,
-    baseUrl: provider.base_url,
-    authMode: (provider.api_key || provider.api_key_env ? "bearer" : "none") as "bearer" | "none"
-  }));
-
-  const models = config.models.filter((model) => model.enabled).map((model) => ({
-    id: model.id,
-    provider: model.provider,
-    model: model.model,
-    label: model.label,
-    enabled: model.enabled,
-    group: model.group
-  }));
-
-  const secrets = await Promise.all(
-    Object.entries(config.providers).map(async ([providerId, provider]) => {
-      const envName = provider.api_key_env;
-      const envValue = envName ? process.env[envName] : undefined;
-      const value = provider.api_key ?? envValue;
-
-      return {
-        providerId,
-        keyName: envName ?? "api_key",
-        value,
-        source: provider.api_key ? "config" : envValue ? "env" : "none"
-      } as const;
-    })
-  );
+  const providers = createRuntimeProviders(config);
+  const models = createRuntimeModels(config);
+  const secrets = await createRuntimeSecrets(config);
 
   const verifiers = await resolveVerifierEndpoints(benchPackId, benchPackConfig, manifest);
   const inferenceRelay = await startInferenceRelay(providers, models, secrets, logger);
@@ -2919,6 +3815,7 @@ async function executeSerialTestCasesMode(
   emit: (event: ProgressEvent) => Promise<void>,
   resultsByModel: Record<string, ScenarioResult[]>,
   runId: string,
+  providerBaseUrlById: Map<string, string>,
   shouldExecuteCell: (scenario: ScenarioMeta, model: RegisteredModel) => boolean = () => true,
   abortSignal?: AbortSignal
 ): Promise<void> {
@@ -2947,6 +3844,7 @@ async function executeSerialTestCasesMode(
           benchPackId,
           scenario,
           model,
+          providerBaseUrl: providerBaseUrlById.get(model.provider),
           abortSignal,
           generation,
           runsPerTest
@@ -2972,22 +3870,31 @@ function buildScenarioExecutionFailureResult(
   generation?: GenerationRequest
 ): ScenarioResult {
   const message = toScenarioExecutionErrorMessage(error, generation, startedAt);
-  const retryableProviderError = isRetryableProviderErrorMessage(`${toErrorMessage(error)} ${message}`);
+  const providerHttpError = getProviderHttpErrorFromError(error);
+  const providerHttpStatus = providerHttpError?.status;
+  const providerError = providerHttpStatus !== undefined;
+  const retryableProviderError = providerHttpStatus !== undefined && isRetryableProviderHttpStatus(providerHttpStatus);
   const completedAt = Date.now();
+  const verifierDetails: Record<string, unknown> = { error: message };
+
+  if (providerHttpError) {
+    verifierDetails.providerHttpStatus = providerHttpStatus;
+    verifierDetails.providerResponseBlank = providerHttpError.responseBlank;
+  }
 
   const failureResult: ScenarioResult = {
     scenarioId: scenario.id,
     status: "fail",
     score: 0,
-    summary: retryableProviderError
-      ? "Provider or network error interrupted this scenario run."
+    summary: providerHttpError
+      ? `Provider returned HTTP status ${providerHttpStatus}${providerHttpError.responseBlank ? " with a blank response" : ""}.`
       : "BenchLocal could not complete this scenario run.",
     note: message,
     rawLog: `error=${message}`,
     verifier: {
       status: "fail",
       summary: "Scenario execution failed before a verifier result was returned.",
-      details: { error: message }
+      details: verifierDetails
     },
     timings: {
       startedAt: new Date(startedAt).toISOString(),
@@ -2998,38 +3905,97 @@ function buildScenarioExecutionFailureResult(
 
   return {
     ...failureResult,
-    errorType: retryableProviderError ? "provider_error" : "execution_error",
+    errorType: providerError ? "provider_error" : "execution_error",
     retryable: retryableProviderError
   } as ScenarioResult;
 }
 
-function getScenarioResultProviderErrorText(result: ScenarioResult): string {
-  return [
-    result.summary,
-    result.note,
-    result.rawLog,
-    result.verifier?.summary,
-    result.verifier?.details ? JSON.stringify(result.verifier.details) : undefined
-  ].filter(Boolean).join("\n");
-}
+function getStructuredProviderHttpError(result: ScenarioResult): CapturedProviderHttpError | undefined {
+  const details = result.verifier?.details;
 
-function classifyReturnedScenarioResult(result: ScenarioResult): ScenarioResult {
-  if (result.errorType || result.status !== "fail") {
-    return result;
+  if (!isRecord(details)) {
+    return undefined;
   }
 
-  const retryableProviderError = isRetryableProviderErrorMessage(getScenarioResultProviderErrorText(result));
+  const status = toHttpStatusCode(details.providerHttpStatus);
+  if (status === undefined || !isProviderHttpErrorStatus(status)) {
+    return undefined;
+  }
 
-  if (!retryableProviderError) {
+  return {
+    status,
+    responseBlank: details.providerResponseBlank === true
+  };
+}
+
+function attachProviderHttpError(result: ScenarioResult, providerHttpError: CapturedProviderHttpError | undefined): ScenarioResult {
+  if (!providerHttpError || result.status !== "fail") {
     return result;
   }
 
   return {
     ...result,
+    verifier: {
+      status: result.verifier?.status ?? "fail",
+      summary: result.verifier?.summary ?? "Provider returned an HTTP error status.",
+      details: {
+        ...(result.verifier?.details ?? {}),
+        providerHttpStatus: providerHttpError.status,
+        providerResponseBlank: providerHttpError.responseBlank
+      }
+    }
+  };
+}
+
+function classifyReturnedScenarioResult(result: ScenarioResult): ScenarioResult {
+  if (result.errorType === "execution_error") {
+    return result;
+  }
+
+  if (result.status !== "fail") {
+    return result.errorType === "provider_error" ? removeProviderErrorClassification(result) : result;
+  }
+
+  const providerHttpError = getStructuredProviderHttpError(result);
+
+  if (!providerHttpError) {
+    return result.errorType === "provider_error" ? removeProviderErrorClassification(result) : result;
+  }
+
+  return {
+    ...result,
     errorType: "provider_error",
-    retryable: true,
-    summary: result.summary || "Provider or network error interrupted this scenario run."
+    retryable: isRetryableProviderHttpStatus(providerHttpError.status),
+    summary: result.summary || `Provider returned HTTP status ${providerHttpError.status}.`
   } as ScenarioResult;
+}
+
+function removeProviderErrorClassification(result: ScenarioResult): ScenarioResult {
+  const { errorType: _errorType, retryable: _retryable, ...unclassifiedResult } = result;
+  return unclassifiedResult as ScenarioResult;
+}
+
+function normalizeRunSummaryProviderErrorClassification(summary: BenchPackRunSummary): BenchPackRunSummary {
+  const resultsByModel = Object.fromEntries(
+    Object.entries(summary.resultsByModel).map(([modelId, results]) => [
+      modelId,
+      results.map((result) => classifyReturnedScenarioResult(result))
+    ])
+  );
+  const events = summary.events.map((event) =>
+    event.type === "scenario_result"
+      ? {
+          ...event,
+          result: classifyReturnedScenarioResult(event.result)
+        }
+      : event
+  );
+
+  return {
+    ...summary,
+    events,
+    resultsByModel
+  };
 }
 
 function applyScenarioTimings(result: ScenarioResult, startedAt: number, completedAt: number): ScenarioResult {
@@ -3165,22 +4131,69 @@ async function runScenarioSafely(
     benchPackId: string;
     scenario: ScenarioMeta;
     model: RegisteredModel;
+    providerBaseUrl?: string;
     abortSignal?: AbortSignal;
     generation: GenerationRequest;
   },
   emit: (event: ProgressEvent) => Promise<void>
 ): Promise<ScenarioResult> {
   const startedAt = Date.now();
+  const timeoutSeconds = getRequestTimeoutSeconds(input.generation);
+  const timeoutMs = timeoutSeconds ? timeoutSeconds * 1000 : undefined;
+  const scenarioController = timeoutMs ? new AbortController() : undefined;
+  let timedOut = false;
+  let timeout: NodeJS.Timeout | undefined;
+
+  const abortScenarioFromParent = () => {
+    scenarioController?.abort(input.abortSignal?.reason ?? createAbortError(input.abortSignal));
+  };
+
+  if (scenarioController && input.abortSignal) {
+    if (input.abortSignal.aborted) {
+      abortScenarioFromParent();
+    } else {
+      input.abortSignal.addEventListener("abort", abortScenarioFromParent, { once: true });
+    }
+  }
 
   try {
-    const result = await prepared.runScenario(input, emit);
-    return applyScenarioTimings(result, startedAt, Date.now());
+    const { providerBaseUrl, ...scenarioInput } = input;
+    const runPromise = captureProviderFetchErrors(
+      providerBaseUrl,
+      () => prepared.runScenario({
+        ...scenarioInput,
+        abortSignal: scenarioController?.signal ?? input.abortSignal
+      }, emit)
+    );
+    const result = await (timeoutMs && timeoutSeconds
+      ? Promise.race([
+          runPromise,
+          new Promise<{ result: ScenarioResult; providerHttpError?: CapturedProviderHttpError }>((_resolve, reject) => {
+            timeout = setTimeout(() => {
+              timedOut = true;
+              const error = createRequestTimeoutError(timeoutSeconds);
+              scenarioController?.abort(error);
+              reject(error);
+            }, timeoutMs);
+          })
+        ])
+      : runPromise);
+    return applyScenarioTimings(
+      attachProviderHttpError(result.result, result.providerHttpError),
+      startedAt,
+      Date.now()
+    );
   } catch (error) {
-    if (isAbortError(error) || input.abortSignal?.aborted) {
+    if (!timedOut && (isAbortError(error) || input.abortSignal?.aborted)) {
       throw error;
     }
 
     return buildScenarioExecutionFailureResult(input.scenario, error, startedAt, input.generation);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+    input.abortSignal?.removeEventListener("abort", abortScenarioFromParent);
   }
 }
 
@@ -3191,6 +4204,7 @@ async function runScenarioWithRepeats(
     benchPackId: string;
     scenario: ScenarioMeta;
     model: RegisteredModel;
+    providerBaseUrl?: string;
     abortSignal?: AbortSignal;
     generation: GenerationRequest;
     runsPerTest: number;
@@ -3238,6 +4252,7 @@ async function executeSerialByModelMode(
   emit: (event: ProgressEvent) => Promise<void>,
   resultsByModel: Record<string, ScenarioResult[]>,
   runId: string,
+  providerBaseUrlById: Map<string, string>,
   shouldExecuteCell: (scenario: ScenarioMeta, model: RegisteredModel) => boolean = () => true,
   abortSignal?: AbortSignal
 ): Promise<void> {
@@ -3278,6 +4293,7 @@ async function executeSerialByModelMode(
           benchPackId,
           scenario,
           model,
+          providerBaseUrl: providerBaseUrlById.get(model.provider),
           abortSignal,
           generation,
           runsPerTest
@@ -3311,6 +4327,7 @@ async function executeParallelModelsMode(
   emit: (event: ProgressEvent) => Promise<void>,
   resultsByModel: Record<string, ScenarioResult[]>,
   runId: string,
+  providerBaseUrlById: Map<string, string>,
   shouldExecuteCell: (scenario: ScenarioMeta, model: RegisteredModel) => boolean = () => true,
   abortSignal?: AbortSignal
 ): Promise<void> {
@@ -3352,6 +4369,7 @@ async function executeParallelModelsMode(
             benchPackId,
             scenario,
             model,
+            providerBaseUrl: providerBaseUrlById.get(model.provider),
             abortSignal,
             generation,
             runsPerTest
@@ -3386,6 +4404,7 @@ async function executeParallelTestCasesMode(
   emit: (event: ProgressEvent) => Promise<void>,
   resultsByModel: Record<string, ScenarioResult[]>,
   runId: string,
+  providerBaseUrlById: Map<string, string>,
   shouldExecuteCell: (scenario: ScenarioMeta, model: RegisteredModel) => boolean = () => true,
   abortSignal?: AbortSignal
 ): Promise<void> {
@@ -3414,6 +4433,7 @@ async function executeParallelTestCasesMode(
             benchPackId,
             scenario,
             model,
+            providerBaseUrl: providerBaseUrlById.get(model.provider),
             abortSignal,
             generation,
             runsPerTest
@@ -3447,6 +4467,7 @@ async function executeFullParallelMode(
   emit: (event: ProgressEvent) => Promise<void>,
   resultsByModel: Record<string, ScenarioResult[]>,
   runId: string,
+  providerBaseUrlById: Map<string, string>,
   shouldExecuteCell: (scenario: ScenarioMeta, model: RegisteredModel) => boolean = () => true,
   abortSignal?: AbortSignal
 ): Promise<void> {
@@ -3476,6 +4497,7 @@ async function executeFullParallelMode(
               benchPackId,
               scenario,
               model,
+              providerBaseUrl: providerBaseUrlById.get(model.provider),
               abortSignal,
               generation,
               runsPerTest
@@ -3549,6 +4571,7 @@ export async function runConfiguredBenchPack(
 
   try {
     const blockingVerifier = hostContext.verifiers.find((verifier) => verifier.required && verifier.status !== "running");
+    const providerBaseUrlById = getProviderBaseUrlById(hostContext.providers);
 
     if (blockingVerifier) {
       if (blockingVerifier.status === "missing_dependency") {
@@ -3577,6 +4600,31 @@ export async function runConfiguredBenchPack(
       throw new Error("No enabled models are configured in BenchLocal.");
     }
 
+    const modelAvailability = await checkModelAvailability(
+      hostContext.providers,
+      selectedModels,
+      hostContext.secrets,
+      {
+        modelIds: selectedModels.map((model) => model.id),
+        abortSignal: options?.abortSignal
+      }
+    );
+    const availableModelIds = new Set(
+      modelAvailability.filter((availability) => availability.status === "online").map((availability) => availability.modelId)
+    );
+    const shouldExecuteAvailableCell = (_scenario: ScenarioMeta, model: RegisteredModel) => availableModelIds.has(model.id);
+    const unavailableModels = modelAvailability.filter((availability) => availability.status !== "online");
+
+    if (unavailableModels.length > 0) {
+      hostContext.logger.info("Skipping currently unavailable models for this pass.", {
+        models: unavailableModels.map((availability) => ({
+          modelId: availability.modelId,
+          reason: availability.reason,
+          details: availability.details
+        }))
+      });
+    }
+
     const scenarios = await benchPack.listScenarios();
     const prepared = await benchPack.prepare(hostContext);
     const resultsByModel: Record<string, ScenarioResult[]> = Object.fromEntries(selectedModels.map((model) => [model.id, []]));
@@ -3597,6 +4645,11 @@ export async function runConfiguredBenchPack(
     await writeRunSummary(artifacts.summaryPath, {
       runId: artifacts.runId,
       runDir: artifacts.runDir,
+      packType: getBenchPackManifestType(manifest),
+      packVersion: manifest.version,
+      packEntry: manifest.entry,
+      packBuildId: manifest.web?.buildId,
+      packManifestHash: manifest.web?.manifestHash,
       benchPackId,
       benchPackName: manifest.name,
       executionMode,
@@ -3627,7 +4680,8 @@ export async function runConfiguredBenchPack(
               emit,
               resultsByModel,
               artifacts.runId,
-              undefined,
+              providerBaseUrlById,
+              shouldExecuteAvailableCell,
               options?.abortSignal
             );
             break;
@@ -3642,19 +4696,20 @@ export async function runConfiguredBenchPack(
               emit,
               resultsByModel,
               artifacts.runId,
-              undefined,
+              providerBaseUrlById,
+              shouldExecuteAvailableCell,
               options?.abortSignal
             );
             break;
           case "parallel_by_test_case":
-            await executeParallelTestCasesMode(scenarios, selectedModels, prepared, benchPackId, generation, runsPerTest, emit, resultsByModel, artifacts.runId, undefined, options?.abortSignal);
+            await executeParallelTestCasesMode(scenarios, selectedModels, prepared, benchPackId, generation, runsPerTest, emit, resultsByModel, artifacts.runId, providerBaseUrlById, shouldExecuteAvailableCell, options?.abortSignal);
             break;
           case "full_parallel":
-            await executeFullParallelMode(scenarios, selectedModels, prepared, benchPackId, generation, runsPerTest, emit, resultsByModel, artifacts.runId, undefined, options?.abortSignal);
+            await executeFullParallelMode(scenarios, selectedModels, prepared, benchPackId, generation, runsPerTest, emit, resultsByModel, artifacts.runId, providerBaseUrlById, shouldExecuteAvailableCell, options?.abortSignal);
             break;
           case "parallel_by_model":
           default:
-            await executeParallelModelsMode(scenarios, selectedModels, prepared, benchPackId, generation, runsPerTest, emit, resultsByModel, artifacts.runId, undefined, options?.abortSignal);
+            await executeParallelModelsMode(scenarios, selectedModels, prepared, benchPackId, generation, runsPerTest, emit, resultsByModel, artifacts.runId, providerBaseUrlById, shouldExecuteAvailableCell, options?.abortSignal);
             break;
         }
       } catch (error) {
@@ -3686,6 +4741,11 @@ export async function runConfiguredBenchPack(
       const summary: BenchPackRunSummary = {
         runId: artifacts.runId,
         runDir: artifacts.runDir,
+        packType: getBenchPackManifestType(manifest),
+        packVersion: manifest.version,
+        packEntry: manifest.entry,
+        packBuildId: manifest.web?.buildId,
+        packManifestHash: manifest.web?.manifestHash,
         benchPackId,
         benchPackName: manifest.name,
         executionMode,
@@ -3782,6 +4842,7 @@ export async function retryScenarioForBenchPackRun(
       );
     }
 
+    const providerBaseUrlById = getProviderBaseUrlById(hostContext.providers);
     const scenarioList = await benchPack.listScenarios();
     const scenarioIndex = scenarioList.findIndex((candidate) => candidate.id === options.scenarioId);
     const scenario = scenarioIndex >= 0 ? scenarioList[scenarioIndex] : null;
@@ -3822,6 +4883,7 @@ export async function retryScenarioForBenchPackRun(
           benchPackId,
           scenario,
           model,
+          providerBaseUrl: providerBaseUrlById.get(model.provider),
           abortSignal: options.abortSignal,
           generation,
           runsPerTest
@@ -3952,6 +5014,7 @@ export async function resumeBenchPackRun(
       );
     }
 
+    const providerBaseUrlById = getProviderBaseUrlById(hostContext.providers);
     const historicalModelIds = getHistoricalRunModelIds(existingSummary);
     const enabledModels = hostContext.models.filter((model) => model.enabled);
     const selectedModels = historicalModelIds
@@ -3969,6 +5032,30 @@ export async function resumeBenchPackRun(
       throw new Error("This saved run has no resumable models.");
     }
 
+    const modelAvailability = await checkModelAvailability(
+      hostContext.providers,
+      selectedModels,
+      hostContext.secrets,
+      {
+        modelIds: selectedModels.map((model) => model.id),
+        abortSignal: options.abortSignal
+      }
+    );
+    const availableModelIds = new Set(
+      modelAvailability.filter((availability) => availability.status === "online").map((availability) => availability.modelId)
+    );
+    const unavailableModels = modelAvailability.filter((availability) => availability.status !== "online");
+
+    if (unavailableModels.length > 0) {
+      hostContext.logger.info("Skipping currently unavailable models while resuming this run.", {
+        models: unavailableModels.map((availability) => ({
+          modelId: availability.modelId,
+          reason: availability.reason,
+          details: availability.details
+        }))
+      });
+    }
+
     const scenarios = await benchPack.listScenarios();
     const existingCellKeys = new Set(
       Object.entries(existingSummary.resultsByModel).flatMap(([modelId, results]) =>
@@ -3976,7 +5063,7 @@ export async function resumeBenchPackRun(
       )
     );
     const shouldExecuteCell = (scenario: ScenarioMeta, model: RegisteredModel) =>
-      !existingCellKeys.has(`${model.id}::${scenario.id}`);
+      availableModelIds.has(model.id) && !existingCellKeys.has(`${model.id}::${scenario.id}`);
     const resultsByModel: Record<string, ScenarioResult[]> = Object.fromEntries(selectedModels.map((model) => [model.id, []]));
     const prepared = await benchPack.prepare(hostContext);
     const executionMode = options.executionMode ?? existingSummary.executionMode ?? "parallel_by_test_case";
@@ -4007,6 +5094,7 @@ export async function resumeBenchPackRun(
               emit,
               resultsByModel,
               existingSummary.runId,
+              providerBaseUrlById,
               shouldExecuteCell,
               options.abortSignal
             );
@@ -4022,6 +5110,7 @@ export async function resumeBenchPackRun(
               emit,
               resultsByModel,
               existingSummary.runId,
+              providerBaseUrlById,
               shouldExecuteCell,
               options.abortSignal
             );
@@ -4037,6 +5126,7 @@ export async function resumeBenchPackRun(
               emit,
               resultsByModel,
               existingSummary.runId,
+              providerBaseUrlById,
               shouldExecuteCell,
               options.abortSignal
             );
@@ -4052,6 +5142,7 @@ export async function resumeBenchPackRun(
               emit,
               resultsByModel,
               existingSummary.runId,
+              providerBaseUrlById,
               shouldExecuteCell,
               options.abortSignal
             );
@@ -4068,6 +5159,7 @@ export async function resumeBenchPackRun(
               emit,
               resultsByModel,
               existingSummary.runId,
+              providerBaseUrlById,
               shouldExecuteCell,
               options.abortSignal
             );
@@ -4154,6 +5246,11 @@ export async function listRunHistoryForBenchPack(
         return {
           runId: summary.runId,
           runDir: summary.runDir,
+          packType: summary.packType,
+          packVersion: summary.packVersion,
+          packEntry: summary.packEntry,
+          packBuildId: summary.packBuildId,
+          packManifestHash: summary.packManifestHash,
           benchPackId: summary.benchPackId,
           benchPackName: summary.benchPackName,
           executionMode: summary.executionMode,
@@ -4184,7 +5281,36 @@ export async function loadRunSummaryForBenchPack(
     throw new Error(`Run history "${runId}" was not found for Bench Pack "${benchPackId}".`);
   }
 
-  return readJsonFile<BenchPackRunSummary>(summaryPath);
+  return normalizeRunSummaryProviderErrorClassification(await readJsonFile<BenchPackRunSummary>(summaryPath));
+}
+
+export async function deleteRunHistoryForBenchPack(
+  config: BenchLocalConfig,
+  benchPackId: string,
+  runIds: string[]
+): Promise<{ removedRunIds: string[] }> {
+  const uniqueRunIds = Array.from(new Set(runIds.map((runId) => runId.trim()).filter(Boolean)));
+  const runRoot = path.resolve(getBenchPackRunRoot(config, benchPackId));
+  const removedRunIds: string[] = [];
+
+  for (const runId of uniqueRunIds) {
+    if (runId !== path.basename(runId)) {
+      throw new Error(`Run history "${runId}" is not a valid run identifier.`);
+    }
+
+    const runDir = path.resolve(runRoot, runId);
+
+    if (!runDir.startsWith(`${runRoot}${path.sep}`)) {
+      throw new Error(`Run history "${runId}" is not inside the Bench Pack run directory.`);
+    }
+
+    if (await pathExists(runDir)) {
+      await fs.rm(runDir, { recursive: true, force: true });
+      removedRunIds.push(runId);
+    }
+  }
+
+  return { removedRunIds };
 }
 
 export async function clearRunHistoryForBenchPack(config: BenchLocalConfig, benchPackId: string): Promise<{ removed: boolean }> {

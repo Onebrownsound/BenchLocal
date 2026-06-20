@@ -2,7 +2,7 @@
   "name": "benchlocal-app",
   "productName": "BenchLocal",
   "private": true,
-  "version": "0.2.5",
+  "version": "0.3.0",
   "description": "BenchLocal desktop app for running and managing LLM Bench Packs.",
   "author": "stevibe",
   "type": "module",
@@ -23,10 +23,12 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "electron-updater": "^6.6.2",
     "lucide-react": "^1.7.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "undici": "^6.25.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.11",

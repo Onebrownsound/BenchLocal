@@ -128,6 +128,7 @@ Official Bench Packs today:
 - [BugFind-15](https://github.com/stevibe/BugFind-15)
 - [DataExtract-15](https://github.com/stevibe/DataExtract-15)
 - [InstructFollow-15](https://github.com/stevibe/InstructFollow-15)
+- [PromptAuthority-15](https://github.com/stevibe/PromptAuthority-15)
 - [ReasonMath-15](https://github.com/stevibe/ReasonMath-15)
 - [StructOutput-15](https://github.com/stevibe/StructOutput-15)
 - [CLI-40](https://github.com/stevibe/CLI-40)
@@ -142,6 +143,23 @@ BenchLocal owns the shared desktop runtime:
 - run execution and result history
 - verifier lifecycle management
 - persisted desktop UI state
+
+## Agent access
+
+BenchLocal can expose a local agent surface so AI agents and automation tools can control benchmark workflows while the desktop UI stays live.
+
+Enable it from **Settings > Agent Access**. The app will show:
+
+- a bearer token
+- the local Agent Guide URL
+- the OpenAPI URL
+- the MCP Streamable HTTP URL
+
+The HTTP API uses JSON commands for actions such as listing Bench Packs, managing providers and models, creating tabs, selecting models, refreshing availability, starting runs, resuming runs, retrying results, and stopping active runs. Live progress is available through Server-Sent Events at `/v1/events`.
+
+MCP-capable agents can connect to `/mcp` with the same bearer token and use standard `benchlocal_*` tools plus BenchLocal state resources. This is the preferred integration path for agents that support tool calls.
+
+See [docs/agent-control-api.md](./docs/agent-control-api.md) for endpoint details, MCP tools/resources, safety rules, and the extension checklist for adding future UI features to the agent surface.
 
 Each Bench Pack owns its benchmark behavior:
 
@@ -175,6 +193,7 @@ Each Bench Pack owns its benchmark behavior:
 - [BENCH_PROTOCOL_V1.md](./BENCH_PROTOCOL_V1.md)
 - [CONFIG_SCHEMA_V1.md](./CONFIG_SCHEMA_V1.md)
 - [BENCHLOCAL_REGISTRY_V1.md](./BENCHLOCAL_REGISTRY_V1.md)
+- [docs/agent-control-api.md](./docs/agent-control-api.md)
 - [docs/macos-release.md](./docs/macos-release.md)
 - [docs/windows-release.md](./docs/windows-release.md)
 - [docs/linux-release.md](./docs/linux-release.md)

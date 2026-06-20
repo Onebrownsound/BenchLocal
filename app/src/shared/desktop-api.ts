@@ -1,16 +1,26 @@
 import type {
+  ArtifactRef,
   BenchPackRegistryEntry,
+  BenchLocalChatRequest,
+  BenchLocalChatResponse,
+  BenchLocalChatStreamEvent,
+  BenchLocalAgentAccessState,
+  BenchLocalAgentSafeConfig,
   BenchLocalConfig,
   BenchLocalThemeDefinition,
   BenchLocalThemeDescriptor,
   GenerationRequest,
   ProgressEvent,
+  ModelAvailability,
   BenchLocalWorkspaceState,
   BenchPackInspection,
   BenchPackRunHistoryEntry,
   BenchPackRunSummary,
-  VerifierEndpoint
+  VerifierEndpoint,
+  WebBenchPackHistoryPayload
 } from "@core";
+
+export type { BenchLocalAgentAccessState } from "@core";
 
 export type DetachedLogsState = {
   workspaceName: string;
@@ -103,9 +113,17 @@ export interface BenchLocalDesktopApi {
   config: {
     load(): Promise<ConfigLoadResult>;
     save(config: BenchLocalConfig): Promise<ConfigLoadResult>;
+    onUpdated(listener: (payload: { config: BenchLocalAgentSafeConfig }) => void): () => void;
+  };
+  agent: {
+    state(): Promise<BenchLocalAgentAccessState>;
+    configure(input: { enabled: boolean; access?: "localhost" | "local_network"; port?: number }): Promise<BenchLocalAgentAccessState>;
+    regenerateToken(): Promise<BenchLocalAgentAccessState>;
+    onState(listener: (state: BenchLocalAgentAccessState) => void): () => void;
   };
   models: {
     discover(input: { provider: BenchLocalConfig["providers"][string] }): Promise<BenchLocalDiscoveredModel[]>;
+    availability(input: { config: BenchLocalConfig; modelIds?: string[] }): Promise<ModelAvailability[]>;
   };
   themes: {
     list(): Promise<BenchLocalThemeDescriptor[]>;
@@ -116,6 +134,7 @@ export interface BenchLocalDesktopApi {
     save(state: BenchLocalWorkspaceState): Promise<{ path: string; created: boolean; state: BenchLocalWorkspaceState }>;
     export(input: { workspaceId: string; state: BenchLocalWorkspaceState }): Promise<{ exported: boolean; filePath?: string }>;
     import(): Promise<{ imported: boolean; workspace?: BenchLocalWorkspaceState["workspaces"][string]; tabs?: BenchLocalWorkspaceState["tabs"] }>;
+    onUpdated(listener: (payload: { state: BenchLocalWorkspaceState }) => void): () => void;
   };
   benchPacks: {
     list(): Promise<BenchPackInspection[]>;
@@ -155,7 +174,33 @@ export interface BenchLocalDesktopApi {
     history(input: { benchPackId: string }): Promise<BenchPackRunHistoryEntry[]>;
     loadHistory(input: { benchPackId: string; runId: string }): Promise<BenchPackRunSummary>;
     clearHistory(input: { benchPackId: string }): Promise<{ removed: boolean }>;
-    onRunEvent(listener: (payload: { tabId: string; event: ProgressEvent }) => void): () => void;
+    deleteHistory(input: { benchPackId: string; runIds: string[] }): Promise<{ removedRunIds: string[] }>;
+    onRunEvent(listener: (payload: { tabId: string; benchPackId?: string; event: ProgressEvent }) => void): () => void;
+  };
+  webPacks: {
+    chat(input: BenchLocalChatRequest): Promise<BenchLocalChatResponse>;
+    streamChat(
+      input: { streamId: string; request: BenchLocalChatRequest },
+      listener: (payload: { streamId: string; event: BenchLocalChatStreamEvent; done?: boolean }) => void
+    ): () => void;
+    saveHistory(input: {
+      benchPackId: string;
+      runId?: string | null;
+      modelIds?: string[];
+      payload: WebBenchPackHistoryPayload;
+    }): Promise<BenchPackRunSummary>;
+    writeArtifact(input: {
+      benchPackId: string;
+      runId?: string | null;
+      modelIds?: string[];
+      artifact: {
+        kind: string;
+        label: string;
+        path?: string;
+        contentType?: string;
+        content: unknown;
+      };
+    }): Promise<{ summary: BenchPackRunSummary; artifact: ArtifactRef }>;
   };
   verifiers: {
     list(): Promise<BenchPackVerifierStatus[]>;

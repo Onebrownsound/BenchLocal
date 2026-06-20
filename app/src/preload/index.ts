@@ -11,12 +11,24 @@ const APP_UPDATE_GET_STATE_CHANNEL = "benchlocal:updates:get-state";
 const APP_UPDATE_CHECK_CHANNEL = "benchlocal:updates:check";
 const APP_UPDATE_INSTALL_CHANNEL = "benchlocal:updates:install";
 const APP_UPDATE_STATE_CHANNEL = "benchlocal:updates:state";
+const CONFIG_UPDATED_CHANNEL = "benchlocal:config:updated";
 const MODELS_DISCOVER_CHANNEL = "benchlocal:models:discover";
+const MODELS_AVAILABILITY_CHANNEL = "benchlocal:models:availability";
+const WORKSPACES_UPDATED_CHANNEL = "benchlocal:workspaces:updated";
 const BENCH_PACK_RUN_EVENT_CHANNEL = "benchlocal:benchpacks:run-event";
 const BENCH_PACK_MUTATION_PROGRESS_CHANNEL = "benchlocal:benchpacks:mutation-progress";
+const WEB_PACK_CHAT_CHANNEL = "benchlocal:webpacks:chat";
+const WEB_PACK_STREAM_CHAT_CHANNEL = "benchlocal:webpacks:stream-chat";
+const WEB_PACK_STREAM_EVENT_CHANNEL = "benchlocal:webpacks:stream-event";
+const WEB_PACK_HISTORY_SAVE_CHANNEL = "benchlocal:webpacks:history-save";
+const WEB_PACK_ARTIFACT_WRITE_CHANNEL = "benchlocal:webpacks:artifact-write";
 const VERIFIERS_PROGRESS_CHANNEL = "benchlocal:verifiers:progress";
 const DETACHED_LOGS_STATE_CHANNEL = "benchlocal:logs:state";
 const DETACHED_LOGS_CLOSED_CHANNEL = "benchlocal:logs:closed";
+const AGENT_STATE_CHANNEL = "benchlocal:agent:state";
+const AGENT_GET_STATE_CHANNEL = "benchlocal:agent:get-state";
+const AGENT_CONFIGURE_CHANNEL = "benchlocal:agent:configure";
+const AGENT_REGENERATE_TOKEN_CHANNEL = "benchlocal:agent:regenerate-token";
 
 const api: BenchLocalDesktopApi = {
   app: {
@@ -53,11 +65,35 @@ const api: BenchLocalDesktopApi = {
   },
   config: {
     load: () => ipcRenderer.invoke("benchlocal:config:load"),
-    save: (config: BenchLocalConfig) => ipcRenderer.invoke("benchlocal:config:save", config)
+    save: (config: BenchLocalConfig) => ipcRenderer.invoke("benchlocal:config:save", config),
+    onUpdated: (listener) => {
+      const wrapped = (_event: Electron.IpcRendererEvent, payload: Parameters<typeof listener>[0]) => {
+        listener(payload);
+      };
+
+      ipcRenderer.on(CONFIG_UPDATED_CHANNEL, wrapped);
+      return () => ipcRenderer.removeListener(CONFIG_UPDATED_CHANNEL, wrapped);
+    }
+  },
+  agent: {
+    state: () => ipcRenderer.invoke(AGENT_GET_STATE_CHANNEL),
+    configure: (input: { enabled: boolean; access?: "localhost" | "local_network"; port?: number }) =>
+      ipcRenderer.invoke(AGENT_CONFIGURE_CHANNEL, input),
+    regenerateToken: () => ipcRenderer.invoke(AGENT_REGENERATE_TOKEN_CHANNEL),
+    onState: (listener) => {
+      const wrapped = (_event: Electron.IpcRendererEvent, state: Parameters<typeof listener>[0]) => {
+        listener(state);
+      };
+
+      ipcRenderer.on(AGENT_STATE_CHANNEL, wrapped);
+      return () => ipcRenderer.removeListener(AGENT_STATE_CHANNEL, wrapped);
+    }
   },
   models: {
     discover: (input: { provider: BenchLocalConfig["providers"][string] }) =>
-      ipcRenderer.invoke(MODELS_DISCOVER_CHANNEL, input)
+      ipcRenderer.invoke(MODELS_DISCOVER_CHANNEL, input),
+    availability: (input: { config: BenchLocalConfig; modelIds?: string[] }) =>
+      ipcRenderer.invoke(MODELS_AVAILABILITY_CHANNEL, input)
   },
   themes: {
     list: () => ipcRenderer.invoke(THEMES_LIST_CHANNEL),
@@ -68,7 +104,15 @@ const api: BenchLocalDesktopApi = {
     save: (state: BenchLocalWorkspaceState) => ipcRenderer.invoke("benchlocal:workspaces:save", state),
     export: (input: { workspaceId: string; state: BenchLocalWorkspaceState }) =>
       ipcRenderer.invoke("benchlocal:workspaces:export", input),
-    import: () => ipcRenderer.invoke("benchlocal:workspaces:import")
+    import: () => ipcRenderer.invoke("benchlocal:workspaces:import"),
+    onUpdated: (listener) => {
+      const wrapped = (_event: Electron.IpcRendererEvent, payload: Parameters<typeof listener>[0]) => {
+        listener(payload);
+      };
+
+      ipcRenderer.on(WORKSPACES_UPDATED_CHANNEL, wrapped);
+      return () => ipcRenderer.removeListener(WORKSPACES_UPDATED_CHANNEL, wrapped);
+    }
   },
   benchPacks: {
     list: () => ipcRenderer.invoke("benchlocal:benchpacks:list"),
@@ -96,14 +140,32 @@ const api: BenchLocalDesktopApi = {
     history: (input: { benchPackId: string }) => ipcRenderer.invoke("benchlocal:benchpacks:history", input),
     loadHistory: (input: { benchPackId: string; runId: string }) => ipcRenderer.invoke("benchlocal:benchpacks:history-load", input),
     clearHistory: (input: { benchPackId: string }) => ipcRenderer.invoke("benchlocal:benchpacks:history-clear", input),
-    onRunEvent: (listener: (payload: { tabId: string; event: ProgressEvent }) => void) => {
-      const wrapped = (_event: Electron.IpcRendererEvent, payload: { tabId: string; event: ProgressEvent }) => {
+    deleteHistory: (input: { benchPackId: string; runIds: string[] }) =>
+      ipcRenderer.invoke("benchlocal:benchpacks:history-delete", input),
+    onRunEvent: (listener: (payload: { tabId: string; benchPackId?: string; event: ProgressEvent }) => void) => {
+      const wrapped = (_event: Electron.IpcRendererEvent, payload: { tabId: string; benchPackId?: string; event: ProgressEvent }) => {
         listener(payload);
       };
 
       ipcRenderer.on(BENCH_PACK_RUN_EVENT_CHANNEL, wrapped);
       return () => ipcRenderer.removeListener(BENCH_PACK_RUN_EVENT_CHANNEL, wrapped);
     }
+  },
+  webPacks: {
+    chat: (input) => ipcRenderer.invoke(WEB_PACK_CHAT_CHANNEL, input),
+    streamChat: (input, listener) => {
+      const wrapped = (_event: Electron.IpcRendererEvent, payload: Parameters<typeof listener>[0]) => {
+        if (payload.streamId === input.streamId) {
+          listener(payload);
+        }
+      };
+
+      ipcRenderer.on(WEB_PACK_STREAM_EVENT_CHANNEL, wrapped);
+      ipcRenderer.send(WEB_PACK_STREAM_CHAT_CHANNEL, input);
+      return () => ipcRenderer.removeListener(WEB_PACK_STREAM_EVENT_CHANNEL, wrapped);
+    },
+    saveHistory: (input) => ipcRenderer.invoke(WEB_PACK_HISTORY_SAVE_CHANNEL, input),
+    writeArtifact: (input) => ipcRenderer.invoke(WEB_PACK_ARTIFACT_WRITE_CHANNEL, input)
   },
   verifiers: {
     list: () => ipcRenderer.invoke("benchlocal:verifiers:list"),
