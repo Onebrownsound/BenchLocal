@@ -43,6 +43,11 @@ const PACKS = {
     runner: "standard",
     risk: "simple"
   },
+  "promptauthority-15": {
+    aliases: ["promptauthority", "prompt", "authority", "pa"],
+    runner: "standard",
+    risk: "simple"
+  },
   "reasonmath-15": {
     aliases: ["reasonmath", "reason", "math", "rm"],
     runner: "standard",

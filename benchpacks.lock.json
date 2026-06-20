@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generatedAt": "2026-06-20T12:31:05.090Z",
+  "generatedAt": "2026-06-20T12:54:09.522Z",
   "registryUrl": "https://raw.githubusercontent.com/stevibe/benchlocal-registry/main/registry.json",
   "updatePolicy": "Frozen vendored snapshots. ./bench sync uses this lock only; ./bench update-lock --force is required to read the registry and replace packs.",
   "packs": [
@@ -23,7 +23,7 @@
         "dist",
         "dist-cli"
       ],
-      "frozenAt": "2026-06-20T12:31:05.096Z"
+      "frozenAt": "2026-06-20T12:54:09.528Z"
     },
     {
       "id": "bugfind-15",
@@ -44,7 +44,7 @@
         "dist",
         "dist-cli"
       ],
-      "frozenAt": "2026-06-20T12:31:05.097Z"
+      "frozenAt": "2026-06-20T12:54:09.530Z"
     },
     {
       "id": "dataextract-15",
@@ -65,7 +65,7 @@
         "dist",
         "dist-cli"
       ],
-      "frozenAt": "2026-06-20T12:31:05.098Z"
+      "frozenAt": "2026-06-20T12:54:09.530Z"
     },
     {
       "id": "instructfollow-15",
@@ -86,7 +86,28 @@
         "dist",
         "dist-cli"
       ],
-      "frozenAt": "2026-06-20T12:31:05.098Z"
+      "frozenAt": "2026-06-20T12:54:09.530Z"
+    },
+    {
+      "id": "promptauthority-15",
+      "runner": "standard",
+      "risk": "simple",
+      "source": {
+        "type": "github",
+        "repo": "stevibe/PromptAuthority-15",
+        "url": "https://github.com/stevibe/PromptAuthority-15.git",
+        "tag": "v1.0.0",
+        "commit": "6ed261b42fcca0df15e4794eeb4da628b1666952",
+        "tree": "8d5ffdfc28dfae2744505c23b9fadd583fa1e61e"
+      },
+      "sourceHash": "sha256:de74bdb7fdcf231426ea774b76bffb71902425f3ce295fb4bb88f99fef0e33e0",
+      "hashIgnores": [
+        ".git",
+        "node_modules",
+        "dist",
+        "dist-cli"
+      ],
+      "frozenAt": "2026-06-20T12:54:09.541Z"
     },
     {
       "id": "reasonmath-15",
@@ -107,7 +128,7 @@
         "dist",
         "dist-cli"
       ],
-      "frozenAt": "2026-06-20T12:31:05.098Z"
+      "frozenAt": "2026-06-20T12:54:09.541Z"
     },
     {
       "id": "structoutput-15",
@@ -128,7 +149,7 @@
         "dist",
         "dist-cli"
       ],
-      "frozenAt": "2026-06-20T12:31:05.099Z"
+      "frozenAt": "2026-06-20T12:54:09.542Z"
     },
     {
       "id": "hermesagent-20",
@@ -149,7 +170,7 @@
         "dist",
         "dist-cli"
       ],
-      "frozenAt": "2026-06-20T12:31:05.101Z"
+      "frozenAt": "2026-06-20T12:54:09.542Z"
     },
     {
       "id": "cli-40",
@@ -170,7 +191,7 @@
         "dist",
         "dist-cli"
       ],
-      "frozenAt": "2026-06-20T12:31:05.102Z"
+      "frozenAt": "2026-06-20T12:54:09.543Z"
     }
   ]
 }
