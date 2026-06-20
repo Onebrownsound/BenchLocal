@@ -1,0 +1,176 @@
+{
+  "version": 1,
+  "generatedAt": "2026-06-20T12:31:05.090Z",
+  "registryUrl": "https://raw.githubusercontent.com/stevibe/benchlocal-registry/main/registry.json",
+  "updatePolicy": "Frozen vendored snapshots. ./bench sync uses this lock only; ./bench update-lock --force is required to read the registry and replace packs.",
+  "packs": [
+    {
+      "id": "toolcall-15",
+      "runner": "standard",
+      "risk": "simple",
+      "source": {
+        "type": "github",
+        "repo": "stevibe/ToolCall-15",
+        "url": "https://github.com/stevibe/ToolCall-15.git",
+        "tag": "v1.0.1",
+        "commit": "edd6cefe4261b67e8166e9f6d77d671042560294",
+        "tree": "32e1890799ba3700338d3bde4edefa4dc63cae95"
+      },
+      "sourceHash": "sha256:58575e983a0f7c62e515013e9813df416ea0d14254930802cb986cb943993831",
+      "hashIgnores": [
+        ".git",
+        "node_modules",
+        "dist",
+        "dist-cli"
+      ],
+      "frozenAt": "2026-06-20T12:31:05.096Z"
+    },
+    {
+      "id": "bugfind-15",
+      "runner": "standard",
+      "risk": "docker-verifier",
+      "source": {
+        "type": "github",
+        "repo": "stevibe/BugFind-15",
+        "url": "https://github.com/stevibe/BugFind-15.git",
+        "tag": "v1.0.1",
+        "commit": "eea2224a531f0937a8fffb4949abcd6db81f4d11",
+        "tree": "e565f72a23160a07a96b42e53d9d100e5888b6a0"
+      },
+      "sourceHash": "sha256:0031cd34109a85f9f823c081c099f033d5e6f2ebb236a9501858f38d5b640fcc",
+      "hashIgnores": [
+        ".git",
+        "node_modules",
+        "dist",
+        "dist-cli"
+      ],
+      "frozenAt": "2026-06-20T12:31:05.097Z"
+    },
+    {
+      "id": "dataextract-15",
+      "runner": "standard",
+      "risk": "simple",
+      "source": {
+        "type": "github",
+        "repo": "Onebrownsound/DataExtract-15",
+        "url": "https://github.com/Onebrownsound/DataExtract-15.git",
+        "tag": "v1.0.0-local",
+        "commit": "eb3adc27447cedb108d968594043a9593ea9278b",
+        "tree": "cde22fb5bece12628b28f79bd647c134c2970e0a"
+      },
+      "sourceHash": "sha256:58098d9cb9909d3c23cdccdf576c3082b25b35a75596ad77cc1036238bc751e7",
+      "hashIgnores": [
+        ".git",
+        "node_modules",
+        "dist",
+        "dist-cli"
+      ],
+      "frozenAt": "2026-06-20T12:31:05.098Z"
+    },
+    {
+      "id": "instructfollow-15",
+      "runner": "standard",
+      "risk": "simple",
+      "source": {
+        "type": "github",
+        "repo": "stevibe/InstructFollow-15",
+        "url": "https://github.com/stevibe/InstructFollow-15.git",
+        "tag": "v1.0.0",
+        "commit": "187af97cb2b892ad57de176b16a254aba7565a65",
+        "tree": "6d41599fd57c57890ad48a1667b60061b6247971"
+      },
+      "sourceHash": "sha256:e49dce3a7729b673e96bc6ce90ddee8adb861e3a2c8313a634c2a08b778b1393",
+      "hashIgnores": [
+        ".git",
+        "node_modules",
+        "dist",
+        "dist-cli"
+      ],
+      "frozenAt": "2026-06-20T12:31:05.098Z"
+    },
+    {
+      "id": "reasonmath-15",
+      "runner": "standard",
+      "risk": "simple",
+      "source": {
+        "type": "github",
+        "repo": "stevibe/ReasonMath-15",
+        "url": "https://github.com/stevibe/ReasonMath-15.git",
+        "tag": "v1.0.0",
+        "commit": "b97632020fa373c52ba92373dbe5dc58b744ce48",
+        "tree": "0b7ff608ac26be945281a1956eb4d6671a7ae729"
+      },
+      "sourceHash": "sha256:14a93b9e06dc8367bc3668b06c3bc924a1a083e8a20ab9facd20ca1b5a08ffa0",
+      "hashIgnores": [
+        ".git",
+        "node_modules",
+        "dist",
+        "dist-cli"
+      ],
+      "frozenAt": "2026-06-20T12:31:05.098Z"
+    },
+    {
+      "id": "structoutput-15",
+      "runner": "standard",
+      "risk": "docker-verifier",
+      "source": {
+        "type": "github",
+        "repo": "stevibe/StructOutput-15",
+        "url": "https://github.com/stevibe/StructOutput-15.git",
+        "tag": "v1.0.0",
+        "commit": "00de86e9bfc9dd3d86ba397d0cf35bcbc04efd1c",
+        "tree": "c732de4fb107348f56c8652e2d2f0bfe5f5f4911"
+      },
+      "sourceHash": "sha256:83b09a1ec767335a29a8d6903088b6969777128c9765939356da73925ef7f2fd",
+      "hashIgnores": [
+        ".git",
+        "node_modules",
+        "dist",
+        "dist-cli"
+      ],
+      "frozenAt": "2026-06-20T12:31:05.099Z"
+    },
+    {
+      "id": "hermesagent-20",
+      "runner": "hermes",
+      "risk": "docker-agent",
+      "source": {
+        "type": "github",
+        "repo": "stevibe/HermesAgent-20",
+        "url": "https://github.com/stevibe/HermesAgent-20.git",
+        "tag": "v1.0.0",
+        "commit": "fa40ab9fb84a329421bbdfc3062cf28f1670de71",
+        "tree": "93cb91022e9449290e01f85a6e3736583154c0f4"
+      },
+      "sourceHash": "sha256:24bcfe3e5cbab6e021f55778b2851708ae8d53723347cf7e062fd5b5ee52e836",
+      "hashIgnores": [
+        ".git",
+        "node_modules",
+        "dist",
+        "dist-cli"
+      ],
+      "frozenAt": "2026-06-20T12:31:05.101Z"
+    },
+    {
+      "id": "cli-40",
+      "runner": "cli40",
+      "risk": "docker-verifier",
+      "source": {
+        "type": "github",
+        "repo": "stevibe/CLI-40",
+        "url": "https://github.com/stevibe/CLI-40.git",
+        "tag": "v1.0.2",
+        "commit": "3b95f86e6edac47183348381a9bb211ffaf09404",
+        "tree": "0f02ebd0158f6f750ad3761fddaa8fd99ea60eb6"
+      },
+      "sourceHash": "sha256:400668b7938a13f9c8271718042e7de411c8843413db100cc6ae79fe3a8de6c1",
+      "hashIgnores": [
+        ".git",
+        "node_modules",
+        "dist",
+        "dist-cli"
+      ],
+      "frozenAt": "2026-06-20T12:31:05.102Z"
+    }
+  ]
+}

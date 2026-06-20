@@ -1,0 +1,1612 @@
+#!/usr/bin/env node
+"use strict";
+
+const childProcess = require("node:child_process");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const fsp = require("node:fs/promises");
+const http = require("node:http");
+const net = require("node:net");
+const os = require("node:os");
+const path = require("node:path");
+
+const ROOT = __dirname;
+const PACK_ROOT = path.join(ROOT, "benchpacks");
+const LOCK_FILE = path.join(ROOT, "benchpacks.lock.json");
+const REGISTRY_URL = "https://raw.githubusercontent.com/stevibe/benchlocal-registry/main/registry.json";
+
+const PACKS = {
+  "toolcall-15": {
+    aliases: ["toolcall", "tool", "tc"],
+    runner: "standard",
+    risk: "simple"
+  },
+  "bugfind-15": {
+    aliases: ["bugfind", "bug", "bf"],
+    runner: "standard",
+    risk: "docker-verifier",
+    verifier: {
+      urlFlag: "--sandbox-url",
+      portEnv: "BUGFIND_SANDBOX_PORT",
+      healthPath: "/health",
+      script: ["node", "scripts/verify-sandbox.mjs", "serve"],
+      stopScript: ["node", "scripts/verify-sandbox.mjs", "stop"]
+    }
+  },
+  "dataextract-15": {
+    aliases: ["dataextract", "data", "extract", "de"],
+    runner: "standard",
+    risk: "simple"
+  },
+  "instructfollow-15": {
+    aliases: ["instructfollow", "instruct", "if"],
+    runner: "standard",
+    risk: "simple"
+  },
+  "reasonmath-15": {
+    aliases: ["reasonmath", "reason", "math", "rm"],
+    runner: "standard",
+    risk: "simple"
+  },
+  "structoutput-15": {
+    aliases: ["structoutput", "struct", "output", "so"],
+    runner: "standard",
+    risk: "docker-verifier",
+    verifier: {
+      urlFlag: "--validator-url",
+      portEnv: "STRUCTOUTPUT_VALIDATOR_PORT",
+      healthPath: "/health",
+      script: ["node", "scripts/verify-sandbox.mjs", "serve"],
+      stopScript: ["node", "scripts/verify-sandbox.mjs", "stop"]
+    }
+  },
+  "hermesagent-20": {
+    aliases: ["hermesagent", "hermes", "ha"],
+    runner: "hermes",
+    risk: "docker-agent"
+  },
+  "cli-40": {
+    aliases: ["cli40", "cli", "shell"],
+    runner: "cli40",
+    risk: "docker-verifier"
+  }
+};
+
+const MODE_ENV = {
+  ollama: { provider: "ollama", hostEnv: "OLLAMA_HOST", authMode: "none" },
+  llamacpp: { provider: "llamacpp", hostEnv: "LLAMACPP_HOST", authMode: "none" },
+  llama: { provider: "llamacpp", hostEnv: "LLAMACPP_HOST", authMode: "none" },
+  openai: { provider: "llamacpp", hostEnv: "LLAMACPP_HOST", authMode: "none" },
+  mlx: { provider: "mlx", hostEnv: "MLX_HOST", authMode: "none" },
+  lmstudio: { provider: "lmstudio", hostEnv: "LMSTUDIO_HOST", authMode: "none" },
+  openrouter: { provider: "openrouter", hostEnv: null, authMode: "bearer" }
+};
+
+function usage(exitCode = 0) {
+  const ids = Object.keys(PACKS).join(", ");
+  console.log(`BenchLocal pack runner
+
+Usage:
+  ./bench <mode> <url> <bench_pack_types> [output_file|auto] [options]
+  ./bench run <mode> <url> <bench_pack_types> [output_file|auto] [options]
+  ./bench list
+  ./bench audit [output_file]
+  ./bench sync
+  ./bench freeze [--keep-git]
+  ./bench update-lock --force
+
+Examples:
+  ./bench llamacpp http://127.0.0.1:9292/v1 instruct results/instruct.json --model qwen3.5-397b-a17b-nvfp4
+  ./bench llamacpp http://127.0.0.1:9292/v1 all --model qwen3.5-397b-a17b-nvfp4
+  ./bench llamacpp http://127.0.0.1:9292/v1 instruct,reason,tool results/light.json --model-match qwen3.5-397b
+  ./bench llamacpp http://127.0.0.1:9292/v1 all results/all.json --model qwen3.5-397b-a17b-nvfp4 --allow-docker
+
+Packs:
+  ${ids}
+
+Options:
+  --model <id>          Exact model id to pass to the packs.
+  --model-match <text>  Pick one /v1/models entry whose id or name contains text.
+  --timeout <seconds>   Per-request timeout. Default: 600.
+  --temperature <n>     Temperature passed to packs that expose it. Default: 0.
+  --scenarios <ids>     Comma-separated scenario ids; forwarded when supported.
+  --allow-docker        Allow Docker verifier packs to run.
+  --fresh               Re-run npm ci --ignore-scripts before building a pack.
+  --no-build            Skip TypeScript build step.
+  --raw                 Ask packs to include raw logs when they support it.
+  --verbose             Stream child command output.
+  --output-dir <dir>    Directory for auto-named run output. Default: bench-results.
+  --label <text>        Extra label added to auto-named output files.
+  --force               For sync/update-lock, replace frozen pack directories.
+  --keep-git            For freeze/sync/update-lock, keep pack .git directories.
+`);
+  process.exit(exitCode);
+}
+
+function readJson(filePath) {
+  return JSON.parse(fs.readFileSync(filePath, "utf8"));
+}
+
+function writeJson(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function parseArgs(argv) {
+  if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
+    usage(0);
+  }
+
+  const command = ["run", "list", "audit", "sync", "freeze", "update-lock"].includes(argv[0]) ? argv.shift() : "run";
+  const options = {
+    command,
+    timeoutSeconds: 600,
+    temperature: "0",
+    allowDocker: false,
+    fresh: false,
+    build: true,
+    raw: false,
+    verbose: false,
+    force: false,
+    keepGit: false,
+    outputDir: path.join(ROOT, "bench-results"),
+    label: undefined,
+    scenarios: undefined,
+    model: undefined,
+    modelMatch: undefined
+  };
+
+  const positionals = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    switch (arg) {
+      case "--model":
+        options.model = argv[++index];
+        break;
+      case "--model-match":
+        options.modelMatch = argv[++index];
+        break;
+      case "--timeout":
+        options.timeoutSeconds = Number.parseInt(argv[++index] ?? "", 10);
+        break;
+      case "--temperature":
+        options.temperature = argv[++index];
+        break;
+      case "--scenarios":
+        options.scenarios = argv[++index];
+        break;
+      case "--allow-docker":
+        options.allowDocker = true;
+        break;
+      case "--fresh":
+        options.fresh = true;
+        break;
+      case "--no-build":
+        options.build = false;
+        break;
+      case "--raw":
+        options.raw = true;
+        break;
+      case "--verbose":
+        options.verbose = true;
+        break;
+      case "--output-dir":
+        options.outputDir = path.resolve(ROOT, argv[++index]);
+        break;
+      case "--label":
+        options.label = argv[++index];
+        break;
+      case "--force":
+        options.force = true;
+        break;
+      case "--keep-git":
+        options.keepGit = true;
+        break;
+      default:
+        if (arg.startsWith("-")) {
+          throw new Error(`Unknown option: ${arg}`);
+        }
+        positionals.push(arg);
+    }
+  }
+
+  if (!Number.isFinite(options.timeoutSeconds) || options.timeoutSeconds <= 0) {
+    throw new Error("--timeout must be a positive integer.");
+  }
+
+  if (command === "run") {
+    if (positionals.length < 3) {
+      usage(1);
+    }
+    options.mode = positionals[0];
+    options.url = positionals[1];
+    options.packSelector = positionals[2];
+    if (positionals[3] && positionals[3] !== "auto") {
+      options.outputFile = path.resolve(ROOT, positionals[3]);
+    }
+  } else if (command === "audit") {
+    options.outputFile = positionals[0] ? path.resolve(ROOT, positionals[0]) : undefined;
+  }
+
+  return options;
+}
+
+function run(command, args, options = {}) {
+  const cwd = options.cwd ?? ROOT;
+  const env = options.env ?? process.env;
+  const verbose = Boolean(options.verbose);
+  return new Promise((resolve, reject) => {
+    const child = childProcess.spawn(command, args, {
+      cwd,
+      env,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      if (verbose) process.stdout.write(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+      if (verbose) process.stderr.write(chunk);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      const result = { code: code ?? 1, stdout, stderr };
+      if (result.code !== 0 && options.check !== false) {
+        const message = [`Command failed: ${command} ${args.join(" ")}`, `cwd: ${cwd}`, stderr || stdout].filter(Boolean).join("\n");
+        reject(new Error(message));
+        return;
+      }
+      resolve(result);
+    });
+  });
+}
+
+function spawnLongRunning(command, args, options = {}) {
+  const child = childProcess.spawn(command, args, {
+    cwd: options.cwd ?? ROOT,
+    env: options.env ?? process.env,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  if (options.verbose) {
+    child.stdout.pipe(process.stdout);
+    child.stderr.pipe(process.stderr);
+  }
+  return child;
+}
+
+function normalizeBaseUrl(input) {
+  const url = new URL(input);
+  url.pathname = url.pathname.replace(/\/+$/, "");
+  return url.toString().replace(/\/$/, "");
+}
+
+function toDockerReachableUrl(input) {
+  const url = new URL(input);
+  if (url.hostname === "127.0.0.1" || url.hostname === "localhost") {
+    url.hostname = "host.docker.internal";
+  }
+  return url.toString();
+}
+
+function slugify(value, fallback = "run") {
+  const slug = String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 96);
+  return slug || fallback;
+}
+
+function shortHash(value) {
+  return crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 10);
+}
+
+function nextUniquePath(filePath) {
+  if (!fs.existsSync(filePath)) return filePath;
+  const parsed = path.parse(filePath);
+  for (let index = 2; index < 10000; index += 1) {
+    const candidate = path.join(parsed.dir, `${parsed.name}-${index}${parsed.ext}`);
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+  throw new Error(`Could not find a unique output path for ${filePath}`);
+}
+
+function buildRunParams(options, modeSpec, modelId, packIds) {
+  return {
+    mode: String(options.mode).toLowerCase(),
+    provider: modeSpec.provider,
+    url: normalizeBaseUrl(options.url),
+    model: modelId,
+    packSelector: options.packSelector,
+    selectedPacks: packIds,
+    timeoutSeconds: options.timeoutSeconds,
+    temperature: String(options.temperature),
+    scenarios: options.scenarios ?? "all",
+    allowDocker: Boolean(options.allowDocker),
+    fresh: Boolean(options.fresh),
+    build: Boolean(options.build),
+    raw: Boolean(options.raw),
+    label: options.label ?? null
+  };
+}
+
+function needsDockerReachableEndpoint(packIds, options) {
+  return Boolean(options.allowDocker) && packIds.some((packId) => ["cli40", "hermes"].includes(PACKS[packId]?.runner));
+}
+
+async function dockerBridgeGateway() {
+  const result = await run("docker", ["network", "inspect", "bridge", "--format", "{{(index .IPAM.Config 0).Gateway}}"], { check: false });
+  const gateway = result.stdout.trim();
+  return result.code === 0 && gateway ? gateway : "host.docker.internal";
+}
+
+async function startDockerEndpointRelay(targetBaseUrl, options) {
+  const target = normalizeBaseUrl(targetBaseUrl);
+  const targetOrigin = new URL(target).origin;
+  const gateway = await dockerBridgeGateway();
+  const server = http.createServer(async (request, response) => {
+    try {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const body = chunks.length > 0 ? Buffer.concat(chunks) : undefined;
+      const targetUrl = new URL(request.url || "/", targetOrigin);
+      const headers = { ...request.headers };
+      delete headers.host;
+      delete headers.connection;
+      delete headers["content-length"];
+      delete headers["transfer-encoding"];
+
+      const upstream = await fetch(targetUrl, {
+        method: request.method,
+        headers,
+        body: request.method === "GET" || request.method === "HEAD" ? undefined : body
+      });
+      const responseHeaders = {};
+      upstream.headers.forEach((value, key) => {
+        if (["content-encoding", "content-length", "transfer-encoding", "connection"].includes(key.toLowerCase())) return;
+        responseHeaders[key] = value;
+      });
+      const responseBody = request.method !== "HEAD" ? Buffer.from(await upstream.arrayBuffer()) : null;
+      response.writeHead(upstream.status, responseHeaders);
+      response.end(responseBody ?? undefined);
+    } catch (error) {
+      if (response.headersSent) {
+        if (!response.writableEnded) response.end();
+        return;
+      }
+      response.writeHead(502, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+    }
+  });
+
+  const port = await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "0.0.0.0", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        reject(new Error("Failed to allocate Docker endpoint relay port."));
+        return;
+      }
+      resolve(address.port);
+    });
+  });
+
+  const targetPath = new URL(target).pathname.replace(/\/+$/, "");
+  const dockerBaseUrl = `http://${gateway}:${port}${targetPath}`;
+  if (options.verbose) {
+    console.error(`Docker endpoint relay: ${dockerBaseUrl} -> ${target}`);
+  }
+  return {
+    dockerBaseUrl,
+    targetBaseUrl: target,
+    gateway,
+    port,
+    close: () => new Promise((resolve) => server.close(() => resolve()))
+  };
+}
+
+function autoOutputFile(options, modeSpec, modelId, packIds) {
+  const params = buildRunParams(options, modeSpec, modelId, packIds);
+  const modelSlug = slugify(modelId, "model");
+  const packSlug = slugify(options.packSelector === "all" ? "all" : packIds.join("+"), "packs");
+  const scenarioSlug = slugify(options.scenarios ? `scenarios-${options.scenarios}` : "scenarios-all", "scenarios-all");
+  const label = options.label ? slugify(options.label) : "";
+  const pieces = [
+    label,
+    modelSlug,
+    `mode-${slugify(options.mode)}`,
+    `packs-${packSlug}`,
+    `temp-${slugify(options.temperature)}`,
+    `timeout-${options.timeoutSeconds}`,
+    scenarioSlug,
+    options.allowDocker ? "docker" : "nodocker",
+    `params-${shortHash(params)}`
+  ].filter(Boolean);
+  const dir = path.join(options.outputDir, modelSlug);
+  return nextUniquePath(path.join(dir, `${pieces.join("__")}.json`));
+}
+
+async function fetchModels(baseUrl) {
+  const url = `${normalizeBaseUrl(baseUrl)}/models`;
+  const response = await fetch(url, { headers: { accept: "application/json" } });
+  if (!response.ok) {
+    throw new Error(`Could not fetch models from ${url}: ${response.status} ${response.statusText}`);
+  }
+  const payload = await response.json();
+  return Array.isArray(payload) ? payload : Array.isArray(payload.data) ? payload.data : [];
+}
+
+async function resolveModel(baseUrl, options) {
+  if (options.model) {
+    return options.model;
+  }
+  const models = await fetchModels(baseUrl);
+  if (options.modelMatch) {
+    const needle = options.modelMatch.toLowerCase();
+    const matches = models.filter((model) => `${model.id ?? ""} ${model.name ?? ""}`.toLowerCase().includes(needle));
+    if (matches.length === 1) {
+      return String(matches[0].id);
+    }
+    throw new Error(`--model-match "${options.modelMatch}" matched ${matches.length} models: ${matches.map((model) => model.id).join(", ")}`);
+  }
+  if (models.length === 1 && models[0]?.id) {
+    return String(models[0].id);
+  }
+  throw new Error(`Endpoint has ${models.length} models. Pass --model or --model-match. Available ids: ${models.map((model) => model.id).join(", ")}`);
+}
+
+function packDir(packId) {
+  return path.join(PACK_ROOT, packId);
+}
+
+function resolvePackIds(selector) {
+  const alias = new Map();
+  for (const [packId, spec] of Object.entries(PACKS)) {
+    alias.set(packId, packId);
+    for (const item of spec.aliases) alias.set(item, packId);
+  }
+
+  const parts = selector.split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
+  const ids = [];
+  for (const part of parts) {
+    if (part === "all") {
+      ids.push(...Object.keys(PACKS));
+      continue;
+    }
+    if (part === "light" || part === "simple") {
+      ids.push(...Object.entries(PACKS).filter(([, spec]) => spec.risk === "simple").map(([id]) => id));
+      continue;
+    }
+    const resolved = alias.get(part);
+    if (!resolved) {
+      throw new Error(`Unknown bench pack "${part}". Run ./bench list for known packs.`);
+    }
+    ids.push(resolved);
+  }
+  return Array.from(new Set(ids));
+}
+
+function listPacks() {
+  for (const [packId, spec] of Object.entries(PACKS)) {
+    console.log(`${packId}\t${spec.risk}\taliases=${spec.aliases.join(",")}`);
+  }
+}
+
+async function fetchRegistry() {
+  const response = await fetch(REGISTRY_URL);
+  if (!response.ok) {
+    throw new Error(`Registry fetch failed: ${response.status} ${response.statusText}`);
+  }
+  return response.json();
+}
+
+function readLock() {
+  if (!fs.existsSync(LOCK_FILE)) return null;
+  return readJson(LOCK_FILE);
+}
+
+function lockPackMap(lock = readLock()) {
+  const map = new Map();
+  for (const pack of lock?.packs ?? []) {
+    map.set(pack.id, pack);
+  }
+  return map;
+}
+
+function repoUrlFromSource(source) {
+  if (source.url) return source.url;
+  if (source.repo) return `https://github.com/${source.repo}.git`;
+  throw new Error(`Lock entry is missing repo/url: ${JSON.stringify(source)}`);
+}
+
+function repoSlugFromUrl(url) {
+  const match = String(url).match(/github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?$/);
+  return match ? match[1] : null;
+}
+
+function removeGitDir(target) {
+  fs.rmSync(path.join(target, ".git"), { recursive: true, force: true });
+}
+
+function walkSourceFiles(dir, files = []) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if ([".git", "node_modules", "dist", "dist-cli"].includes(entry.name)) continue;
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      walkSourceFiles(fullPath, files);
+    } else if (entry.isFile()) {
+      files.push(fullPath);
+    }
+  }
+  return files;
+}
+
+function sourceHash(dir) {
+  const hash = crypto.createHash("sha256");
+  const files = walkSourceFiles(dir).sort((left, right) => left.localeCompare(right));
+  for (const file of files) {
+    const relative = path.relative(dir, file).split(path.sep).join("/");
+    hash.update(relative);
+    hash.update("\0");
+    hash.update(fs.readFileSync(file));
+    hash.update("\0");
+  }
+  return `sha256:${hash.digest("hex")}`;
+}
+
+async function gitValue(dir, args, required = true) {
+  const result = await run("git", args, { cwd: dir, check: required });
+  if (result.code !== 0) return null;
+  return result.stdout.trim() || null;
+}
+
+async function lockEntryFromCurrentPack(packId, existing = null) {
+  const dir = packDir(packId);
+  if (!fs.existsSync(dir)) {
+    throw new Error(`${packId} is missing; run ./bench sync or ./bench update-lock --force first.`);
+  }
+
+  const hasGit = fs.existsSync(path.join(dir, ".git"));
+  let source = existing?.source;
+  if (hasGit) {
+    const url = await gitValue(dir, ["remote", "get-url", "origin"]);
+    const commit = await gitValue(dir, ["rev-parse", "HEAD"]);
+    const tree = await gitValue(dir, ["rev-parse", "HEAD^{tree}"]);
+    const tag = await gitValue(dir, ["describe", "--tags", "--exact-match", "HEAD"], false);
+    source = {
+      type: "github",
+      repo: repoSlugFromUrl(url),
+      url,
+      tag: tag ?? existing?.source?.tag ?? null,
+      commit,
+      tree
+    };
+  }
+
+  if (!source?.commit || (!source.repo && !source.url)) {
+    throw new Error(`${packId} has no .git directory and no prior lock entry to preserve its source.`);
+  }
+
+  return {
+    id: packId,
+    runner: PACKS[packId].runner,
+    risk: PACKS[packId].risk,
+    source,
+    sourceHash: sourceHash(dir),
+    hashIgnores: [".git", "node_modules", "dist", "dist-cli"],
+    frozenAt: new Date().toISOString()
+  };
+}
+
+async function writeCurrentLock(options) {
+  const existing = lockPackMap();
+  const lock = {
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    registryUrl: REGISTRY_URL,
+    updatePolicy: "Frozen vendored snapshots. ./bench sync uses this lock only; ./bench update-lock --force is required to read the registry and replace packs.",
+    packs: []
+  };
+
+  for (const packId of Object.keys(PACKS)) {
+    lock.packs.push(await lockEntryFromCurrentPack(packId, existing.get(packId)));
+  }
+
+  writeJson(LOCK_FILE, lock);
+  if (!options.keepGit) {
+    for (const packId of Object.keys(PACKS)) {
+      removeGitDir(packDir(packId));
+    }
+  }
+  console.log(`Wrote ${LOCK_FILE}`);
+  if (!options.keepGit) {
+    console.log("Removed pack .git directories; sources are now pinned in benchpacks.lock.json.");
+  }
+  return lock;
+}
+
+async function materializePack(entry, options) {
+  const target = packDir(entry.id);
+  if (fs.existsSync(target)) {
+    const currentHash = sourceHash(target);
+    if (currentHash === entry.sourceHash) {
+      if (!options.keepGit) removeGitDir(target);
+      console.log(`frozen ${entry.id} ok (${entry.source.commit})`);
+      return;
+    }
+
+    if (!options.force) {
+      throw new Error(`${entry.id} differs from benchpacks.lock.json. Refusing to replace it without --force.`);
+    }
+  }
+
+  await fsp.mkdir(PACK_ROOT, { recursive: true });
+  const tempRoot = await fsp.mkdtemp(path.join(PACK_ROOT, `.tmp-${entry.id}-`));
+  const checkout = path.join(tempRoot, "checkout");
+  try {
+    await run("git", ["clone", repoUrlFromSource(entry.source), checkout], { verbose: options.verbose });
+    await run("git", ["checkout", "--force", entry.source.commit], { cwd: checkout, verbose: options.verbose });
+    const actualCommit = await gitValue(checkout, ["rev-parse", "HEAD"]);
+    if (actualCommit !== entry.source.commit) {
+      throw new Error(`${entry.id} resolved to ${actualCommit}, expected ${entry.source.commit}`);
+    }
+    if (!options.keepGit) removeGitDir(checkout);
+    fs.rmSync(target, { recursive: true, force: true });
+    await fsp.rename(checkout, target);
+    const actualHash = sourceHash(target);
+    if (entry.sourceHash && actualHash !== entry.sourceHash) {
+      throw new Error(`${entry.id} source hash mismatch after restore: ${actualHash} != ${entry.sourceHash}`);
+    }
+    console.log(`restored frozen ${entry.id} ${entry.source.repo ?? entry.source.url}@${entry.source.commit}`);
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+}
+
+async function materializeRegistryPack(registryPack, options) {
+  const entry = {
+    id: registryPack.id,
+    runner: PACKS[registryPack.id].runner,
+    risk: PACKS[registryPack.id].risk,
+    source: {
+      type: "github",
+      repo: registryPack.source.repo,
+      url: `https://github.com/${registryPack.source.repo}.git`,
+      tag: registryPack.source.tag,
+      commit: registryPack.source.tag,
+      tree: null
+    },
+    sourceHash: null,
+    hashIgnores: [".git", "node_modules", "dist", "dist-cli"],
+    frozenAt: new Date().toISOString()
+  };
+
+  const target = packDir(entry.id);
+  await fsp.mkdir(PACK_ROOT, { recursive: true });
+  const tempRoot = await fsp.mkdtemp(path.join(PACK_ROOT, `.tmp-${entry.id}-`));
+  const checkout = path.join(tempRoot, "checkout");
+  try {
+    await run("git", ["clone", "--branch", registryPack.source.tag, entry.source.url, checkout], { verbose: options.verbose });
+    entry.source.commit = await gitValue(checkout, ["rev-parse", "HEAD"]);
+    entry.source.tree = await gitValue(checkout, ["rev-parse", "HEAD^{tree}"]);
+    if (!options.keepGit) removeGitDir(checkout);
+    fs.rmSync(target, { recursive: true, force: true });
+    await fsp.rename(checkout, target);
+    entry.sourceHash = sourceHash(target);
+    console.log(`updated ${entry.id} ${entry.source.repo}@${entry.source.tag} ${entry.source.commit}`);
+    return entry;
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+}
+
+async function syncPacks(options) {
+  const lock = readLock();
+  if (!lock) {
+    throw new Error("No benchpacks.lock.json found. Refusing registry sync; run ./bench update-lock --force to create a frozen lock.");
+  }
+  for (const entry of lock.packs ?? []) {
+    await materializePack(entry, options);
+  }
+}
+
+async function updateLockFromRegistry(options) {
+  if (!options.force) {
+    throw new Error("Refusing to update frozen packs without --force. This reads the remote registry, replaces benchpacks, regenerates benchpacks.lock.json, and should be followed by reviewing bench-results/audit.json.");
+  }
+
+  const registry = await fetchRegistry();
+  const lock = {
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    registryUrl: REGISTRY_URL,
+    updatePolicy: "Frozen vendored snapshots. ./bench sync uses this lock only; ./bench update-lock --force is required to read the registry and replace packs.",
+    packs: []
+  };
+
+  for (const pack of registry.packs ?? []) {
+    if (pack.source?.type !== "github") {
+      console.log(`skip ${pack.id}: source ${pack.source?.type}`);
+      continue;
+    }
+    if (!PACKS[pack.id]) {
+      console.log(`skip ${pack.id}: no local runner registered`);
+      continue;
+    }
+    lock.packs.push(await materializeRegistryPack(pack, options));
+  }
+
+  writeJson(LOCK_FILE, lock);
+  console.log(`Wrote ${LOCK_FILE}`);
+
+  const report = await auditPacks();
+  const auditPath = path.join(ROOT, "bench-results", "audit.json");
+  writeJson(auditPath, report);
+  console.log(`Wrote ${auditPath}`);
+}
+
+function walkFiles(dir, files = []) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === ".git" || entry.name === "node_modules" || entry.name === "package-lock.json") continue;
+    if (entry.name === "dist" || entry.name === "dist-cli") continue;
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      walkFiles(fullPath, files);
+    } else if (entry.isFile()) {
+      files.push(fullPath);
+    }
+  }
+  return files;
+}
+
+function grepCount(dir, regex) {
+  let count = 0;
+  const samples = [];
+  for (const file of walkFiles(dir)) {
+    let text;
+    try {
+      text = fs.readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    const lines = text.split(/\r?\n/);
+    for (let index = 0; index < lines.length; index += 1) {
+      if (regex.test(lines[index])) {
+        count += 1;
+        if (samples.length < 8) {
+          samples.push(`${path.relative(ROOT, file)}:${index + 1}`);
+        }
+      }
+    }
+  }
+  return { count, samples };
+}
+
+function auditDockerSurface(dir) {
+  const files = walkFiles(dir);
+  const findings = [];
+  const dockerFiles = [];
+  const runScripts = [];
+
+  function rel(file) {
+    return path.relative(ROOT, file);
+  }
+
+  function addFinding(severity, message, evidence = []) {
+    findings.push({ severity, message, evidence });
+  }
+
+  function hasDockerSubcommand(text, subcommand) {
+    const escaped = subcommand.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`\\bdocker\\b[\\s\\S]{0,160}?["']${escaped}["']|\\bdocker\\s+${escaped}\\b`).test(text);
+  }
+
+  for (const file of files) {
+    const basename = path.basename(file);
+    if (!basename.startsWith("Dockerfile") && !basename.startsWith("docker-compose.")) continue;
+
+    const text = fs.readFileSync(file, "utf8");
+    const lines = text.split(/\r?\n/);
+    const summary = {
+      path: rel(file),
+      baseImages: lines
+        .map((line) => line.match(/^\s*FROM\s+([^\s]+)/i)?.[1])
+        .filter(Boolean),
+      hasUserDirective: /^\s*USER\s+\S+/mi.test(text),
+      exposedPorts: lines
+        .map((line) => line.match(/^\s*EXPOSE\s+(.+)/i)?.[1])
+        .filter(Boolean),
+      secretArgs: lines
+        .map((line, index) => ({ index: index + 1, line }))
+        .filter(({ line }) => /^\s*ARG\s+.*(secret|token|password|api[_-]?key|private[_-]?key)/i.test(line))
+        .map(({ index }) => `${rel(file)}:${index}`),
+      copiesEnvFiles: lines
+        .map((line, index) => ({ index: index + 1, line }))
+        .filter(({ line }) => /^\s*COPY\s+.*\.env\b/i.test(line))
+        .map(({ index }) => `${rel(file)}:${index}`),
+      remoteBuildSteps: lines
+        .map((line, index) => ({ index: index + 1, line }))
+        .filter(({ line }) => /\bcurl\b.*\|\s*(sh|bash)|\bgit\s+clone\b|\bnpm\s+install\s+-g\b|\bpip\s+install\b/i.test(line))
+        .map(({ index }) => `${rel(file)}:${index}`)
+    };
+
+    if (!summary.hasUserDirective) {
+      addFinding("medium", "Dockerfile has no USER directive; container defaults to root.", [summary.path]);
+    }
+    if (summary.secretArgs.length > 0) {
+      addFinding("critical", "Dockerfile declares secret-like ARG names.", summary.secretArgs);
+    }
+    if (summary.copiesEnvFiles.length > 0) {
+      addFinding("high", "Dockerfile appears to copy .env files into the image.", summary.copiesEnvFiles);
+    }
+    if (summary.remoteBuildSteps.length > 0) {
+      addFinding("medium", "Docker build fetches remote code or packages; rebuild only from trusted network/cache.", summary.remoteBuildSteps);
+    }
+
+    dockerFiles.push(summary);
+  }
+
+  for (const file of files) {
+    if (!/\.(mjs|js|ts|json|sh)$/.test(file)) continue;
+    const text = fs.readFileSync(file, "utf8");
+    if (!/\bdocker\b/.test(text)) continue;
+
+    const summary = {
+      path: rel(file),
+      runsDocker: hasDockerSubcommand(text, "run"),
+      buildsDocker: hasDockerSubcommand(text, "build"),
+      privileged: /--privileged/.test(text),
+      dockerSocketMount: /\/var\/run\/docker\.sock/.test(text),
+      hostNetwork: /--network["'\s,]+host/.test(text),
+      networkNone: /--network["'\s,]+none/.test(text),
+      readOnlyRootFs: /--read-only/.test(text),
+      capDropAll: /--cap-drop["'\s,]+ALL/.test(text),
+      noNewPrivileges: /no-new-privileges/.test(text),
+      pidsLimit: /--pids-limit/.test(text),
+      memoryLimit: /--memory/.test(text),
+      cpuLimit: /--cpus/.test(text),
+      hostGateway: /host\.docker\.internal:host-gateway/.test(text),
+      bindMountsHostPath: /["']-v["']|--mount/.test(text)
+    };
+
+    if (summary.runsDocker) {
+      if (summary.privileged) addFinding("critical", "Docker run uses --privileged.", [summary.path]);
+      if (summary.dockerSocketMount) addFinding("critical", "Docker run mounts the host Docker socket.", [summary.path]);
+      if (summary.hostNetwork) addFinding("high", "Docker run uses host networking.", [summary.path]);
+      if (!summary.noNewPrivileges) addFinding("medium", "Docker run lacks no-new-privileges.", [summary.path]);
+      if (!summary.readOnlyRootFs) addFinding("medium", "Docker run lacks --read-only root filesystem.", [summary.path]);
+      if (!summary.capDropAll) addFinding("medium", "Docker run does not drop all Linux capabilities.", [summary.path]);
+      if (!summary.memoryLimit || !summary.cpuLimit) addFinding("medium", "Docker run lacks explicit CPU or memory limits.", [summary.path]);
+      if (summary.hostGateway) addFinding("medium", "Docker run exposes host.docker.internal to the container for model endpoint access.", [summary.path]);
+      if (summary.bindMountsHostPath) addFinding("medium", "Docker run bind-mounts a host path into the container.", [summary.path]);
+    }
+
+    runScripts.push(summary);
+  }
+
+  const blocker = findings.some((finding) => finding.severity === "critical" || finding.severity === "high");
+  return {
+    dockerFiles,
+    runScripts,
+    findings,
+    safeWithExplicitOptIn: !blocker
+  };
+}
+
+async function auditPack(packId) {
+  const dir = packDir(packId);
+  const spec = PACKS[packId];
+  const locked = lockPackMap().get(packId);
+  const pkgPath = path.join(dir, "package.json");
+  const manifestPath = path.join(dir, "benchlocal.pack.json");
+  if (!fs.existsSync(pkgPath)) {
+    return { packId, status: "missing", safeLocalRuntime: false, findings: [`${pkgPath} missing`] };
+  }
+
+  const pkg = readJson(pkgPath);
+  const scripts = pkg.scripts ?? {};
+  const lifecycleHooks = ["preinstall", "install", "postinstall", "prepare", "prepublishOnly"].filter((name) => scripts[name]);
+  const manifest = fs.existsSync(manifestPath) ? readJson(manifestPath) : {};
+  const verifiers = manifest.verifiers ?? manifest.sidecars ?? [];
+  const secrets = grepCount(dir, /(AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]+|-----BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY-----)/);
+  const shell = grepCount(dir, /\b(child_process|spawn\(|execFile|exec\(|docker\b|sudo\b)\b/);
+  const fsMutation = grepCount(dir, /\b(writeFile|fs\.rm|rm\(|unlink|chmod|chown)\b/);
+  const dynamicCode = grepCount(dir, /\b(eval\(|new Function|Function\()/);
+  const docker = auditDockerSurface(dir);
+  const currentSourceHash = locked?.sourceHash ? sourceHash(dir) : null;
+  const sourceHashMatches = locked?.sourceHash ? currentSourceHash === locked.sourceHash : null;
+  let audit = null;
+  try {
+    const result = await run("npm", ["audit", "--json"], { cwd: dir, check: false });
+    audit = JSON.parse(result.stdout || "{}").metadata?.vulnerabilities ?? null;
+  } catch (error) {
+    audit = { error: error instanceof Error ? error.message : String(error) };
+  }
+
+  const findings = [];
+  if (lifecycleHooks.length > 0) findings.push(`npm lifecycle hooks present: ${lifecycleHooks.join(", ")}`);
+  if (audit && typeof audit.total === "number" && audit.total > 0) findings.push(`npm audit reports ${audit.total} vulnerabilities`);
+  if (secrets.count > 0) findings.push(`secret-like patterns found: ${secrets.samples.join(", ")}`);
+  if (sourceHashMatches === false) findings.push(`source differs from benchpacks.lock.json: ${currentSourceHash} != ${locked.sourceHash}`);
+  if (spec.risk !== "simple") findings.push(`requires explicit Docker opt-in: ${spec.risk}`);
+  if (dynamicCode.count > 0 && packId !== "toolcall-15") findings.push(`dynamic code pattern found: ${dynamicCode.samples.join(", ")}`);
+  for (const finding of docker.findings) {
+    findings.push(`docker ${finding.severity}: ${finding.message} ${finding.evidence.join(", ")}`);
+  }
+
+  const safeLocalRuntime = lifecycleHooks.length === 0 &&
+    (!audit || audit.total === 0) &&
+    secrets.count === 0 &&
+    sourceHashMatches !== false &&
+    (spec.risk === "simple" || docker.safeWithExplicitOptIn) &&
+    (dynamicCode.count === 0 || packId === "toolcall-15");
+
+  return {
+    packId,
+    status: findings.length === 0 ? "pass" : spec.risk === "simple" ? "review" : "docker_opt_in",
+    safeLocalRuntime,
+    runner: spec.runner,
+    risk: spec.risk,
+    git: fs.existsSync(path.join(dir, ".git"))
+      ? (await run("git", ["log", "-1", "--oneline", "--decorate"], { cwd: dir })).stdout.trim()
+      : null,
+    frozenSource: locked ? {
+      source: locked.source,
+      sourceHash: locked.sourceHash,
+      currentSourceHash,
+      matches: sourceHashMatches
+    } : null,
+    npmAudit: audit,
+    lifecycleHooks,
+    verifiers: verifiers.map((verifier) => ({ id: verifier.id, defaultMode: verifier.defaultMode })),
+    scans: {
+      secrets,
+      shellExecution: shell,
+      fsMutation,
+      dynamicCode,
+      docker
+    },
+    findings,
+    notes: packId === "toolcall-15"
+      ? ["Uses Function() only after a strict math-expression character allowlist."]
+      : []
+  };
+}
+
+async function auditPacks(packIds = Object.keys(PACKS)) {
+  const report = {
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    root: ROOT,
+    packs: []
+  };
+  for (const packId of packIds) {
+    report.packs.push(await auditPack(packId));
+  }
+  return report;
+}
+
+async function ensureDeps(packId, options) {
+  const dir = packDir(packId);
+  if (options.fresh || !fs.existsSync(path.join(dir, "node_modules"))) {
+    await run("npm", ["ci", "--ignore-scripts"], { cwd: dir, verbose: options.verbose });
+  }
+}
+
+async function buildPack(packId, options) {
+  if (!options.build) return;
+  const spec = PACKS[packId];
+  const dir = packDir(packId);
+  if (spec.runner === "cli40") {
+    await run("npm", ["run", "build"], { cwd: dir, verbose: options.verbose });
+  } else if (spec.runner === "hermes") {
+    await run("npm", ["run", "build:benchlocal"], { cwd: dir, verbose: options.verbose });
+  } else {
+    await run("npm", ["run", "build:cli"], { cwd: dir, verbose: options.verbose });
+  }
+}
+
+async function allocatePort() {
+  return await new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(address.port);
+      });
+    });
+  });
+}
+
+async function waitForHttp(url, timeoutMs = 120000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ok = await new Promise((resolve) => {
+      const request = http.get(url, (response) => {
+        response.resume();
+        resolve(response.statusCode >= 200 && response.statusCode < 500);
+      });
+      request.setTimeout(1000, () => {
+        request.destroy();
+        resolve(false);
+      });
+      request.on("error", () => resolve(false));
+    });
+    if (ok) return;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  throw new Error(`Timed out waiting for ${url}`);
+}
+
+async function startVerifier(packId, options) {
+  const spec = PACKS[packId];
+  if (!spec.verifier) return null;
+  const dir = packDir(packId);
+  const port = await allocatePort();
+  const env = { ...process.env, [spec.verifier.portEnv]: String(port) };
+  const child = spawnLongRunning(spec.verifier.script[0], spec.verifier.script.slice(1), { cwd: dir, env, verbose: options.verbose });
+  const url = `http://127.0.0.1:${port}`;
+  try {
+    await waitForHttp(`${url}${spec.verifier.healthPath}`);
+  } catch (error) {
+    child.kill("SIGTERM");
+    throw error;
+  }
+  return {
+    url,
+    flag: spec.verifier.urlFlag,
+    async stop() {
+      try {
+        await run(spec.verifier.stopScript[0], spec.verifier.stopScript.slice(1), { cwd: dir, env, check: false });
+      } finally {
+        child.kill("SIGTERM");
+      }
+    }
+  };
+}
+
+async function dockerImageExists(image) {
+  const result = await run("docker", ["image", "inspect", image], { check: false });
+  return result.code === 0;
+}
+
+async function startCli40Verifier(dir, options) {
+  const image = process.env.CLI40_IMAGE || "cli40-dev";
+  if (!(await dockerImageExists(image))) {
+    await run("docker", ["build", "-t", image, "verification"], { cwd: dir, verbose: options.verbose });
+  }
+
+  const hostPort = await allocatePort();
+  const containerName = `benchlocal-cli40-${crypto.randomUUID().slice(0, 8)}`;
+  await run("docker", [
+    "run",
+    "-d",
+    "--rm",
+    "--name",
+    containerName,
+    "--security-opt",
+    "no-new-privileges",
+    "--memory",
+    "512m",
+    "--cpus",
+    "1",
+    "--add-host",
+    "host.docker.internal:host-gateway",
+    "-p",
+    `${hostPort}:4040`,
+    image
+  ], { verbose: options.verbose });
+
+  const baseUrl = `http://127.0.0.1:${hostPort}`;
+  try {
+    await waitForHttp(`${baseUrl}/health`);
+  } catch (error) {
+    await run("docker", ["rm", "-f", containerName], { check: false });
+    throw error;
+  }
+
+  return {
+    baseUrl,
+    async stop() {
+      await run("docker", ["rm", "-f", containerName], { check: false });
+    }
+  };
+}
+
+async function startHermesVerifier(dir, options) {
+  const image = process.env.HERMES_AGENT_20_IMAGE || "hermesagent20-dev";
+  if (!(await dockerImageExists(image))) {
+    await run("docker", ["build", "-t", image, "verification"], { cwd: dir, verbose: options.verbose });
+  }
+
+  const hostPort = await allocatePort();
+  const containerName = `benchlocal-hermes-${crypto.randomUUID().slice(0, 8)}`;
+  const verificationDir = path.join(dir, "verification");
+  await run("docker", [
+    "run",
+    "-d",
+    "--rm",
+    "--name",
+    containerName,
+    "-p",
+    `${hostPort}:4010`,
+    "-v",
+    `${verificationDir}:/opt/verification`,
+    "--entrypoint",
+    "sh",
+    image,
+    "-lc",
+    "(/opt/hermes-venv/bin/pip show pytest >/dev/null 2>&1 || /opt/hermes-venv/bin/pip install -q pytest) && exec node /opt/verification/server.mjs"
+  ], { verbose: options.verbose });
+
+  const baseUrl = `http://127.0.0.1:${hostPort}`;
+  try {
+    await waitForHttp(`${baseUrl}/health`);
+  } catch (error) {
+    const logs = await run("docker", ["logs", "--tail", "100", containerName], { check: false });
+    await run("docker", ["rm", "-f", containerName], { check: false });
+    throw new Error(`${error instanceof Error ? error.message : String(error)}\nverifier_logs=${logs.stdout || logs.stderr}`);
+  }
+
+  return {
+    baseUrl,
+    async stop() {
+      await run("docker", ["rm", "-f", containerName], { check: false });
+    }
+  };
+}
+
+function standardEnv(modeSpec, url, modelId, options) {
+  const env = {
+    ...process.env,
+    LLM_MODELS: `${modeSpec.provider}:${modelId}`,
+    LLM_MODELS_2: "",
+    MODEL_REQUEST_TIMEOUT_SECONDS: String(options.timeoutSeconds)
+  };
+  if (modeSpec.hostEnv) {
+    env[modeSpec.hostEnv] = url;
+  }
+  return env;
+}
+
+function commonScenarioArgs(options) {
+  const args = [];
+  if (options.scenarios) args.push("--scenarios", options.scenarios);
+  args.push("--temperature", String(options.temperature));
+  args.push("--timeout", String(options.timeoutSeconds));
+  if (options.raw) args.push("--show-raw");
+  return args;
+}
+
+function extractJsonPayload(stdout) {
+  const trimmed = stdout.trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {}
+  for (let index = 0; index < trimmed.length; index += 1) {
+    if (trimmed[index] !== "{") continue;
+    const candidate = trimmed.slice(index).trim();
+    try {
+      return JSON.parse(candidate);
+    } catch {}
+  }
+  return null;
+}
+
+function extractJsonObjects(stdout) {
+  const objects = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let index = 0; index < stdout.length; index += 1) {
+    const ch = stdout[index];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === "\"") {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === "{") {
+      if (depth === 0) start = index;
+      depth += 1;
+    } else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        const candidate = stdout.slice(start, index + 1);
+        try {
+          objects.push(JSON.parse(candidate));
+        } catch {}
+        start = -1;
+      }
+    }
+  }
+  return objects;
+}
+
+function summarizePackPayload(payload) {
+  if (!payload) return null;
+  if (payload.scores) return payload.scores;
+  if (payload.results && Array.isArray(payload.results)) {
+    const values = payload.results.map((item) => typeof item.score === "number" ? item.score : 0);
+    return {
+      resultCount: values.length,
+      averageScore: values.length ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length) : 0
+    };
+  }
+  return null;
+}
+
+async function runStandardPack(packId, modeSpec, modelId, baseUrl, options) {
+  const dir = packDir(packId);
+  let verifier = null;
+  try {
+    if (PACKS[packId].verifier) {
+      verifier = await startVerifier(packId, options);
+    }
+    const args = ["dist-cli/cli/run.js", "--json", "--model", `${modeSpec.provider}:${modelId}`, ...commonScenarioArgs(options)];
+    if (verifier) args.push(verifier.flag, verifier.url);
+    const result = await run("node", args, {
+      cwd: dir,
+      env: standardEnv(modeSpec, baseUrl, modelId, options),
+      verbose: options.verbose
+    });
+    const payload = extractJsonPayload(result.stdout);
+    return {
+      packId,
+      status: "completed",
+      runner: "standard",
+      payload,
+      summary: summarizePackPayload(payload),
+      stdoutTail: result.stdout.slice(-4000),
+      stderrTail: result.stderr.slice(-4000)
+    };
+  } finally {
+    if (verifier) await verifier.stop();
+  }
+}
+
+async function runCli40(packId, modeSpec, modelId, baseUrl, options) {
+  const dir = packDir(packId);
+  const dockerBaseUrl = options.dockerBaseUrl ?? toDockerReachableUrl(baseUrl);
+  const scenarioCards = readJson(path.join(dir, "verification", "scenario-data.json"));
+  const scenarioMap = new Map(scenarioCards.map((scenario) => [scenario.id, scenario]));
+  const scenarioIds = options.scenarios
+    ? options.scenarios.split(",").map((item) => item.trim()).filter(Boolean)
+    : scenarioCards.map((scenario) => scenario.id);
+  for (const scenarioId of scenarioIds) {
+    if (!scenarioMap.has(scenarioId)) {
+      throw new Error(`Unknown CLI-40 scenario ${scenarioId}`);
+    }
+  }
+
+  const model = {
+    id: modelId,
+    label: modelId,
+    provider: modeSpec.provider,
+    providerModel: modelId,
+    inferenceBaseUrl: dockerBaseUrl,
+    authMode: options.apiKey ? "bearer" : "none",
+    apiKey: options.apiKey,
+    exposedModel: modelId
+  };
+
+  const verifier = await startCli40Verifier(dir, options);
+  const results = [];
+  const errors = [];
+  try {
+    for (const scenarioId of scenarioIds) {
+      const controller = new AbortController();
+      const timeoutMs = (options.timeoutSeconds + 30) * 1000;
+      const timeout = setTimeout(() => controller.abort(new Error(`CLI-40 scenario ${scenarioId} timed out after ${options.timeoutSeconds + 30}s.`)), timeoutMs);
+      try {
+        const response = await fetch(new URL("/run-scenario", verifier.baseUrl), {
+          method: "POST",
+          headers: {
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            scenarioId,
+            runId: crypto.randomUUID(),
+            model,
+            generation: {
+              temperature: Number(options.temperature),
+              request_timeout_seconds: options.timeoutSeconds
+            }
+          }),
+          signal: controller.signal
+        });
+
+        if (!response.ok) {
+          const detail = await response.text();
+          const summary = `Verifier request failed with ${response.status} ${response.statusText}`;
+          errors.push(`${scenarioId}: ${summary}: ${detail}`);
+          results.push({
+            scenarioId,
+            status: "fail",
+            score: 0,
+            summary,
+            rawLog: detail
+          });
+          continue;
+        }
+
+        results.push(await response.json());
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        errors.push(`${scenarioId}: ${message}`);
+        results.push({
+          scenarioId,
+          status: "fail",
+          score: 0,
+          summary: message,
+          rawLog: message
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+  } finally {
+    await verifier.stop();
+  }
+
+  return {
+    packId,
+    status: "completed",
+    runner: "cli40",
+    payload: { results },
+    summary: summarizePackPayload({ results }),
+    errors,
+    stderrTail: errors.slice(-8).join("\n"),
+    stdoutTail: results.slice(-8).map((result) => JSON.stringify({
+      scenarioId: result.scenarioId,
+      status: result.status,
+      score: result.score,
+      summary: result.summary
+    })).join("\n")
+  };
+}
+
+async function runHermes(packId, modeSpec, modelId, baseUrl, options) {
+  const dir = packDir(packId);
+  const dockerBaseUrl = options.dockerBaseUrl ?? toDockerReachableUrl(baseUrl);
+  const hermesProvider = modeSpec.provider === "openrouter" ? "openrouter" : "custom";
+  const listResult = await run("node", ["scripts/run-scenarios.mjs", "--list"], { cwd: dir });
+  const knownScenarioIds = listResult.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim().split(/\s+/)[0])
+    .filter((id) => /^HA-\d+$/i.test(id));
+  const scenarioIds = options.scenarios
+    ? options.scenarios.split(",").map((item) => item.trim()).filter(Boolean)
+    : knownScenarioIds;
+  if (options.scenarios) {
+    for (const scenarioId of scenarioIds) {
+      if (!knownScenarioIds.includes(scenarioId)) {
+        throw new Error(`Unknown Hermes scenario ${scenarioId}`);
+      }
+    }
+  }
+
+  const model = {
+    id: `${hermesProvider}:${modelId}`,
+    label: modelId,
+    provider: hermesProvider,
+    providerModel: modelId,
+    inferenceBaseUrl: dockerBaseUrl,
+    authMode: options.apiKey ? "bearer" : "none",
+    apiKey: options.apiKey,
+    exposedModel: modelId
+  };
+
+  const verifier = await startHermesVerifier(dir, options);
+  const results = [];
+  const errors = [];
+  try {
+    for (const scenarioId of scenarioIds) {
+      const controller = new AbortController();
+      const timeoutMs = (options.timeoutSeconds + 30) * 1000;
+      const timeout = setTimeout(() => controller.abort(new Error(`Hermes scenario ${scenarioId} timed out after ${options.timeoutSeconds + 30}s.`)), timeoutMs);
+      try {
+        const response = await fetch(new URL("/run-scenario", verifier.baseUrl), {
+          method: "POST",
+          headers: {
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            scenarioId,
+            runId: `dev-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
+            model,
+            generation: {
+              temperature: Number(options.temperature),
+              request_timeout_seconds: options.timeoutSeconds
+            }
+          }),
+          signal: controller.signal
+        });
+
+        if (!response.ok) {
+          const detail = await response.text();
+          const summary = `Verifier request failed with ${response.status} ${response.statusText}`;
+          errors.push(`${scenarioId}: ${summary}: ${detail}`);
+          results.push({
+            scenarioId,
+            status: "fail",
+            score: 0,
+            summary,
+            rawLog: detail
+          });
+          continue;
+        }
+
+        results.push(await response.json());
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        errors.push(`${scenarioId}: ${message}`);
+        results.push({
+          scenarioId,
+          status: "fail",
+          score: 0,
+          summary: message,
+          rawLog: message
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+  } finally {
+    await verifier.stop();
+  }
+
+  return {
+    packId,
+    status: "completed",
+    runner: "hermes",
+    payload: { results },
+    summary: summarizePackPayload({ results }),
+    errors,
+    stderrTail: errors.slice(-8).join("\n"),
+    stdoutTail: results.slice(-8).map((result) => JSON.stringify({
+      scenarioId: result.scenarioId,
+      status: result.status,
+      score: result.score,
+      summary: result.summary
+    })).join("\n")
+  };
+}
+
+async function runPack(packId, modeSpec, modelId, baseUrl, options) {
+  const spec = PACKS[packId];
+  const dir = packDir(packId);
+  if (!fs.existsSync(dir)) {
+    return { packId, status: "skipped", reason: "pack is not cloned; run ./bench sync" };
+  }
+  if (spec.risk !== "simple" && !options.allowDocker) {
+    return { packId, status: "skipped", reason: `${spec.risk} requires --allow-docker` };
+  }
+  await ensureDeps(packId, options);
+  await buildPack(packId, options);
+  if (spec.runner === "cli40") return runCli40(packId, modeSpec, modelId, baseUrl, options);
+  if (spec.runner === "hermes") return runHermes(packId, modeSpec, modelId, baseUrl, options);
+  return runStandardPack(packId, modeSpec, modelId, baseUrl, options);
+}
+
+async function runBench(options) {
+  const modeSpec = MODE_ENV[String(options.mode).toLowerCase()];
+  if (!modeSpec) {
+    throw new Error(`Unknown mode "${options.mode}". Supported modes: ${Object.keys(MODE_ENV).join(", ")}`);
+  }
+  const baseUrl = normalizeBaseUrl(options.url);
+  const modelId = await resolveModel(baseUrl, options);
+  const packIds = resolvePackIds(options.packSelector);
+  let dockerRelay = null;
+  if (needsDockerReachableEndpoint(packIds, options)) {
+    dockerRelay = await startDockerEndpointRelay(baseUrl, options);
+    options.dockerBaseUrl = dockerRelay.dockerBaseUrl;
+    console.log(`Docker endpoint relay: ${dockerRelay.dockerBaseUrl} -> ${dockerRelay.targetBaseUrl}`);
+  }
+  if (!options.outputFile) {
+    options.outputFile = autoOutputFile(options, modeSpec, modelId, packIds);
+  }
+  const runParams = buildRunParams(options, modeSpec, modelId, packIds);
+  const audit = await auditPacks(packIds);
+  const aggregate = {
+    version: 1,
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    root: ROOT,
+    outputFile: options.outputFile,
+    runParams,
+    dockerRelay: dockerRelay ? {
+      dockerBaseUrl: dockerRelay.dockerBaseUrl,
+      targetBaseUrl: dockerRelay.targetBaseUrl,
+      gateway: dockerRelay.gateway
+    } : null,
+    endpoint: baseUrl,
+    mode: options.mode,
+    provider: modeSpec.provider,
+    model: modelId,
+    selectedPacks: packIds,
+    audit,
+    results: []
+  };
+  writeJson(options.outputFile, aggregate);
+
+  try {
+    for (const packId of packIds) {
+      console.log(`\n== ${packId} ==`);
+      try {
+        const result = await runPack(packId, modeSpec, modelId, baseUrl, options);
+        aggregate.results.push(result);
+        console.log(`${packId}: ${result.status}${result.reason ? ` (${result.reason})` : ""}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        aggregate.results.push({ packId, status: "failed", error: message });
+        console.error(`${packId}: failed`);
+        console.error(message);
+      }
+      writeJson(options.outputFile, aggregate);
+    }
+
+    aggregate.completedAt = new Date().toISOString();
+    writeJson(options.outputFile, aggregate);
+  } finally {
+    if (dockerRelay) await dockerRelay.close();
+  }
+  console.log(`\nWrote ${options.outputFile}`);
+}
+
+async function main() {
+  const options = parseArgs(process.argv.slice(2));
+  if (options.command === "list") {
+    listPacks();
+    return;
+  }
+  if (options.command === "sync") {
+    await syncPacks(options);
+    return;
+  }
+  if (options.command === "freeze") {
+    await writeCurrentLock(options);
+    return;
+  }
+  if (options.command === "update-lock") {
+    await updateLockFromRegistry(options);
+    return;
+  }
+  if (options.command === "audit") {
+    const report = await auditPacks();
+    if (options.outputFile) {
+      writeJson(options.outputFile, report);
+      console.log(`Wrote ${options.outputFile}`);
+    } else {
+      console.log(JSON.stringify(report, null, 2));
+    }
+    return;
+  }
+  await runBench(options);
+}
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+});

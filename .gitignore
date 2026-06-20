@@ -6,3 +6,6 @@ out
 .DS_Store
 .env.release.local
 .env.release.*.local
+benchpacks/
+bench-results/
+.render/
